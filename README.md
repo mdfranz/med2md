@@ -1,8 +1,6 @@
 # med2md
 
-A powerful terminal user interface (TUI) application written in Rust for downloading Medium articles and converting them into clean Markdown files, along with all associated images downloaded locally.
-
-It features subscriber-only article support (by providing session cookies) and a built-in Markdown previewer directly in your terminal.
+A terminal user interface (TUI) application written in Rust for downloading Medium articles and converting them into clean Markdown files, along with all associated images downloaded locally.It features subscriber-only article support (by providing session cookies) and a built-in Markdown previewer directly in your terminal.
 
 ---
 
@@ -72,6 +70,8 @@ cargo run --release
 
 ### Main View (Downloader)
 
+![Main downloader view](link-selector.png)
+
 | Key / Control | Action |
 | --- | --- |
 | `Tab` | Focus next input field (`SID` ➔ `UID` ➔ `URLs`) |
@@ -82,6 +82,8 @@ cargo run --release
 | `Esc` or `Ctrl + C` | Exit the application |
 
 ### Markdown Preview Picker View
+
+![Markdown preview picker](markdown-viewer.png)
 
 Press `Ctrl + P` to toggle this view. It lists all `.md` files in the current folder.
 
