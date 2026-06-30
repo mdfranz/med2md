@@ -17,12 +17,7 @@ use scraper::{Html, Selector};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, USER_AGENT};
 use tokio::sync::mpsc;
 use markup5ever::{QualName, Namespace, LocalName};
-
-enum ActiveField {
-    Sid,
-    Uid,
-    Urls,
-}
+use rss::Channel as RssChannel;
 
 enum AppView {
     Download,
@@ -32,6 +27,7 @@ enum AppView {
         preview_lines: Vec<Line<'static>>,
         preview_scroll_y: usize,
     },
+    FeedSelector,
 }
 
 enum AppEvent {
@@ -42,46 +38,44 @@ enum AppEvent {
 struct App {
     sid: String,
     uid: String,
+    cf_clearance: String,
     urls: Vec<String>,
     cursor_x: usize,
     cursor_y: usize,
-    sid_cursor: usize,
-    uid_cursor: usize,
-    active_field: ActiveField,
     logs: Vec<String>,
     is_downloading: bool,
+    force_download: bool,
     urls_scroll_y: usize,
     view: AppView,
+    output_dir: String,
+    feed_articles: Vec<(String, String, String, String)>,
+    feed_selected: Vec<bool>,
+    feed_cursor: usize,
+    feed_scroll: usize,
 }
 
 impl App {
-    fn new() -> Self {
-        let sid = std::env::var("MEDIUM_SID").unwrap_or_default();
-        let uid = std::env::var("MEDIUM_UID").unwrap_or_default();
-        let active_field = if sid.is_empty() || uid.is_empty() {
-            ActiveField::Sid
-        } else {
-            ActiveField::Urls
-        };
-        let sid_cursor = sid.chars().count();
-        let uid_cursor = uid.chars().count();
+    fn new(sid: String, uid: String, cf_clearance: String, output_dir: String) -> Self {
         Self {
             sid,
             uid,
+            cf_clearance,
+            output_dir,
             urls: vec![String::new()],
             cursor_x: 0,
             cursor_y: 0,
-            sid_cursor,
-            uid_cursor,
-            active_field,
             logs: vec![
-                "Welcome to Medium TUI Downloader!".to_string(),
-                "Press Tab to switch fields, Ctrl+S to download, Esc to exit.".to_string(),
-                "Press Ctrl+P at any time to open/close the Markdown Preview Picker.".to_string(),
+                "Welcome to med2md! Paste URLs below, then Ctrl+S to download.".to_string(),
+                "Ctrl+P: Markdown preview picker  |  Ctrl+L: Clear log  |  Esc: Quit".to_string(),
             ],
             is_downloading: false,
+            force_download: false,
             urls_scroll_y: 0,
             view: AppView::Download,
+            feed_articles: Vec::<(String, String, String, String)>::new(),
+            feed_selected: Vec::new(),
+            feed_cursor: 0,
+            feed_scroll: 0,
         }
     }
 }
@@ -91,44 +85,6 @@ fn get_char_byte_index(s: &str, char_idx: usize) -> usize {
         .map(|(byte_idx, _)| byte_idx)
         .nth(char_idx)
         .unwrap_or_else(|| s.len())
-}
-
-fn handle_single_line_key(value: &mut String, cursor: &mut usize, key: KeyEvent) {
-    match key.code {
-        KeyCode::Char(c) => {
-            let idx = get_char_byte_index(value, *cursor);
-            value.insert(idx, c);
-            *cursor += 1;
-        }
-        KeyCode::Backspace => {
-            if *cursor > 0 {
-                *cursor -= 1;
-                let idx = get_char_byte_index(value, *cursor);
-                value.remove(idx);
-            }
-        }
-        KeyCode::Delete => {
-            if *cursor < value.chars().count() {
-                let idx = get_char_byte_index(value, *cursor);
-                value.remove(idx);
-            }
-        }
-        KeyCode::Left => {
-            *cursor = cursor.saturating_sub(1);
-        }
-        KeyCode::Right => {
-            if *cursor < value.chars().count() {
-                *cursor += 1;
-            }
-        }
-        KeyCode::Home => {
-            *cursor = 0;
-        }
-        KeyCode::End => {
-            *cursor = value.chars().count();
-        }
-        _ => {}
-    }
 }
 
 fn handle_multiline_key(app: &mut App, key: KeyEvent) {
@@ -249,24 +205,44 @@ fn handle_paste_urls(app: &mut App, pasted: &str) {
 }
 
 fn handle_paste(app: &mut App, text: &str) {
-    let cleaned_text = text.replace('\r', "");
-    match app.active_field {
-        ActiveField::Sid => {
-            let single_line = cleaned_text.replace('\n', "");
-            let idx = get_char_byte_index(&app.sid, app.sid_cursor);
-            app.sid.insert_str(idx, &single_line);
-            app.sid_cursor += single_line.chars().count();
-        }
-        ActiveField::Uid => {
-            let single_line = cleaned_text.replace('\n', "");
-            let idx = get_char_byte_index(&app.uid, app.uid_cursor);
-            app.uid.insert_str(idx, &single_line);
-            app.uid_cursor += single_line.chars().count();
-        }
-        ActiveField::Urls => {
-            handle_paste_urls(app, &cleaned_text);
-        }
+    handle_paste_urls(app, &text.replace('\r', ""));
+}
+
+fn handle_feed_selector_key(app: &mut App, key: KeyEvent) -> bool {
+    if key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) {
+        return true;
     }
+    match key.code {
+        KeyCode::Up => {
+            if app.feed_cursor > 0 {
+                app.feed_cursor -= 1;
+            }
+        }
+        KeyCode::Down => {
+            if app.feed_cursor + 1 < app.feed_articles.len() {
+                app.feed_cursor += 1;
+            }
+        }
+        KeyCode::Char(' ') => {
+            if app.feed_cursor < app.feed_selected.len() {
+                app.feed_selected[app.feed_cursor] = !app.feed_selected[app.feed_cursor];
+            }
+        }
+        KeyCode::Enter => {
+            let urls: Vec<String> = app.feed_articles.iter().enumerate()
+                .filter(|(i, _)| app.feed_selected.get(*i).copied().unwrap_or(false))
+                .map(|(_, (_, url, _, _))| url.clone())
+                .collect();
+            if !urls.is_empty() {
+                app.urls = urls;
+                app.cursor_y = 0;
+                app.cursor_x = 0;
+            }
+            app.view = AppView::Download;
+        }
+        _ => {}
+    }
+    false
 }
 
 fn handle_key(
@@ -274,6 +250,10 @@ fn handle_key(
     key: KeyEvent,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) -> bool {
+    if matches!(app.view, AppView::FeedSelector) {
+        return handle_feed_selector_key(app, key);
+    }
+
     if key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) {
         return true;
     }
@@ -287,6 +267,7 @@ fn handle_key(
             AppView::Picker { .. } => {
                 app.view = AppView::Download;
             }
+            AppView::FeedSelector => {}
         }
         return false;
     }
@@ -306,35 +287,7 @@ fn handle_key(
                 return false;
             }
 
-            match app.active_field {
-                ActiveField::Sid => {
-                    if key.code == KeyCode::Tab || key.code == KeyCode::Enter {
-                        app.active_field = ActiveField::Uid;
-                    } else if key.code == KeyCode::BackTab {
-                        app.active_field = ActiveField::Urls;
-                    } else {
-                        handle_single_line_key(&mut app.sid, &mut app.sid_cursor, key);
-                    }
-                }
-                ActiveField::Uid => {
-                    if key.code == KeyCode::Tab || key.code == KeyCode::Enter {
-                        app.active_field = ActiveField::Urls;
-                    } else if key.code == KeyCode::BackTab {
-                        app.active_field = ActiveField::Sid;
-                    } else {
-                        handle_single_line_key(&mut app.uid, &mut app.uid_cursor, key);
-                    }
-                }
-                ActiveField::Urls => {
-                    if key.code == KeyCode::Tab {
-                        app.active_field = ActiveField::Sid;
-                    } else if key.code == KeyCode::BackTab {
-                        app.active_field = ActiveField::Uid;
-                    } else {
-                        handle_multiline_key(app, key);
-                    }
-                }
-            }
+            handle_multiline_key(app, key);
         }
         AppView::Picker {
             files,
@@ -366,20 +319,21 @@ fn handle_key(
                 _ => {}
             }
         }
+        AppView::FeedSelector => {}
     }
     false
 }
 
 fn enter_picker_view(app: &mut App) {
     let mut files = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(".") {
+    if let Ok(entries) = std::fs::read_dir(&app.output_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_file() {
                 if let Some(ext) = path.extension() {
                     if ext == "md" {
-                        if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                            files.push(name.to_string());
+                        if let Some(p) = path.to_str() {
+                            files.push(p.to_string());
                         }
                     }
                 }
@@ -389,7 +343,7 @@ fn enter_picker_view(app: &mut App) {
     files.sort();
 
     if files.is_empty() {
-        app.logs.push("Warning: No markdown files found in current directory.".to_string());
+        app.logs.push(format!("Warning: No markdown files found in {}.", app.output_dir));
         return;
     }
 
@@ -565,6 +519,9 @@ fn start_download(app: &mut App, tx: mpsc::UnboundedSender<AppEvent>) {
 
     let sid = app.sid.trim().to_string();
     let uid = app.uid.trim().to_string();
+    let cf_clearance = app.cf_clearance.trim().to_string();
+    let output_dir = app.output_dir.clone();
+    let force_download = app.force_download;
 
     if sid.is_empty() {
         app.logs.push("Warning: MEDIUM_SID is not set. Fetching public version.".to_string());
@@ -573,9 +530,15 @@ fn start_download(app: &mut App, tx: mpsc::UnboundedSender<AppEvent>) {
     }
 
     app.is_downloading = true;
-    app.logs.push(format!("Starting download of {} articles...", urls.len()));
+    app.logs.push(format!("Starting download of {} articles to {}...", urls.len(), output_dir));
 
     tokio::spawn(async move {
+        if let Err(e) = tokio::fs::create_dir_all(&output_dir).await {
+            let _ = tx.send(AppEvent::Log(format!("Error: Failed to create output directory {}: {}", output_dir, e)));
+            let _ = tx.send(AppEvent::DownloadFinished);
+            return;
+        }
+
         let client = match reqwest::Client::builder().build() {
             Ok(c) => c,
             Err(e) => {
@@ -590,7 +553,7 @@ fn start_download(app: &mut App, tx: mpsc::UnboundedSender<AppEvent>) {
             let total = urls.len();
             let _ = tx.send(AppEvent::Log(format!("[{}/{}] Downloading {}...", num, total, url_str)));
 
-            match perform_download(&client, url_str, &sid, &uid, &tx).await {
+            match perform_download(&client, url_str, &sid, &uid, &cf_clearance, &output_dir, force_download, &tx).await {
                 Ok(filename) => {
                     let _ = tx.send(AppEvent::Log(format!("[{}/{}] Success! Saved to {}", num, total, filename)));
                 }
@@ -953,44 +916,318 @@ fn extract_slug(url: &str) -> String {
     }
 }
 
+fn clean_rss_url(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(mut u) => {
+            let cleaned: Vec<(String, String)> = u.query_pairs()
+                .filter(|(k, _)| !k.starts_with("source") && k != "referrer" && k != "gi")
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect();
+            u.set_query(None);
+            if !cleaned.is_empty() {
+                let mut qs = u.query_pairs_mut();
+                for (k, v) in cleaned {
+                    qs.append_pair(&k, &v);
+                }
+            }
+            u.to_string()
+        }
+        Err(_) => url.to_string(),
+    }
+}
+
+fn parse_rss_items(content: &str) -> Vec<(i64, String, String, String)> {
+    match RssChannel::read_from(content.as_bytes()) {
+        Ok(channel) => channel.items().iter()
+            .filter_map(|item| {
+                let title = item.title()?.to_string();
+                let link = item.link()?.to_string();
+                if link.is_empty() { return None; }
+                let ts = item.pub_date()
+                    .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
+                    .map(|dt| dt.timestamp())
+                    .unwrap_or(0);
+                let author = item.dublin_core_ext()
+                    .and_then(|dc| dc.creators().first().cloned())
+                    .or_else(|| item.author().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                Some((ts, title, link, author))
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn extract_following_from_html(
+    html: &str,
+) -> (Vec<String>, Vec<String>, Vec<(i64, String, String, String)>) {
+    let marker = "window.__APOLLO_STATE__ = ";
+    let start = match html.find(marker) {
+        Some(i) => i + marker.len(),
+        None => return (Vec::new(), Vec::new(), Vec::new()),
+    };
+    let end = match html[start..].find("</script>") {
+        Some(i) => start + i,
+        None => return (Vec::new(), Vec::new(), Vec::new()),
+    };
+    let json_str = &html[start..end];
+
+    let state: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return (Vec::new(), Vec::new(), Vec::new()),
+    };
+
+    let mut usernames = Vec::new();
+    let mut pub_slugs = Vec::new();
+    let mut posts: Vec<(i64, String, String, String)> = Vec::new();
+
+    let obj = match state.as_object() {
+        Some(o) => o,
+        None => return (Vec::new(), Vec::new(), Vec::new()),
+    };
+
+    // First pass: build user-key → display name map
+    let mut user_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (key, value) in obj {
+        if key.starts_with("User:") {
+            let display = value.get("name").and_then(|v| v.as_str())
+                .or_else(|| value.get("username").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_string();
+            if !display.is_empty() {
+                user_names.insert(key.clone(), display);
+            }
+            if let Some(u) = value.get("username").and_then(|v| v.as_str()) {
+                if !u.is_empty() && !usernames.contains(&u.to_string()) {
+                    usernames.push(u.to_string());
+                }
+            }
+        } else if key.starts_with("Publication:") {
+            if let Some(s) = value.get("slug").and_then(|v| v.as_str()) {
+                if !s.is_empty() && !pub_slugs.contains(&s.to_string()) {
+                    pub_slugs.push(s.to_string());
+                }
+            }
+        }
+    }
+
+    // Second pass: extract Post objects with resolved author
+    for (key, value) in obj {
+        if !key.starts_with("Post:") { continue; }
+        let title = value.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let url = value.get("mediumUrl").and_then(|v| v.as_str())
+            .or_else(|| value.get("uniqueSlug").and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .to_string();
+        if title.is_empty() || url.is_empty() { continue; }
+        let ts = value.get("firstPublishedAt")
+            .or_else(|| value.get("publishedAt"))
+            .or_else(|| value.get("createdAt"))
+            .and_then(|v| v.as_i64())
+            .map(|ms| ms / 1000)
+            .unwrap_or(0);
+        let author = value.get("creator")
+            .and_then(|c| c.get("__ref"))
+            .and_then(|r| r.as_str())
+            .and_then(|r| user_names.get(r))
+            .cloned()
+            .unwrap_or_default();
+        posts.push((ts, title, url, author));
+    }
+
+    posts.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    (usernames, pub_slugs, posts)
+}
+
+fn format_ts(ts: i64) -> String {
+    if ts == 0 { return String::new(); }
+    match chrono::DateTime::from_timestamp(ts, 0) {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
+        None => String::new(),
+    }
+}
+
+async fn fetch_following_feed(
+    sid: &str,
+    uid: &str,
+    cf_clearance: &str,
+) -> Result<Vec<(String, String, String, String)>, String> {
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|e| format!("Failed to create client: {}", e))?;
+
+    let mut page_headers = build_cookie_headers(sid, uid, cf_clearance);
+    page_headers.insert(ACCEPT, HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"));
+
+    // Try the actual following feed first; fall back to /me/feed if Cloudflare blocks it.
+    let (html, feed_url_used) = {
+        let resp = client
+            .get("https://medium.com/?feed=following")
+            .headers(page_headers.clone())
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch feed page: {}", e))?;
+
+        if resp.status().is_success() {
+            tracing::info!("Fetched /?feed=following successfully");
+            let text = resp.text().await.map_err(|e| format!("Failed to read feed page: {}", e))?;
+            (text, "/?feed=following")
+        } else {
+            tracing::warn!(status = %resp.status(), "/?feed=following blocked, falling back to /me/feed");
+            let text = client
+                .get("https://medium.com/me/feed")
+                .headers(page_headers)
+                .send()
+                .await
+                .map_err(|e| format!("Failed to fetch fallback feed page: {}", e))?
+                .text()
+                .await
+                .map_err(|e| format!("Failed to read fallback feed page: {}", e))?;
+            (text, "/me/feed")
+        }
+    };
+
+    tracing::info!(source = feed_url_used, "Parsing Apollo state");
+    let (usernames, pub_slugs, apollo_posts) = extract_following_from_html(&html);
+
+    if usernames.is_empty() && pub_slugs.is_empty() && apollo_posts.is_empty() {
+        return Err("No followed users or publications found. Check your MEDIUM_SID and MEDIUM_CF_CLEARANCE.".to_string());
+    }
+
+    tracing::info!(
+        users = usernames.len(),
+        publications = pub_slugs.len(),
+        apollo_posts = apollo_posts.len(),
+        "Fetching RSS feeds"
+    );
+
+    let mut articles: Vec<(i64, String, String, String)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    // Seed with posts found directly in Apollo state (these match what the web UI shows)
+    for (ts, title, url, author) in apollo_posts {
+        let clean = clean_rss_url(&url);
+        if seen.insert(clean.clone()) {
+            articles.push((ts, title, clean, author));
+        }
+    }
+
+    for username in &usernames {
+        let feed_url = format!("https://medium.com/feed/@{}", username);
+        let mut h = build_cookie_headers(sid, uid, cf_clearance);
+        h.insert(ACCEPT, HeaderValue::from_static("application/rss+xml, text/xml, */*"));
+        match client.get(&feed_url).headers(h).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(text) = resp.text().await {
+                    let items = parse_rss_items(&text);
+                    tracing::info!(username, count = items.len(), "Fetched user RSS feed");
+                    for (ts, title, url, author) in items {
+                        let clean = clean_rss_url(&url);
+                        if seen.insert(clean.clone()) {
+                            articles.push((ts, title, clean, author));
+                        }
+                    }
+                }
+            }
+            Ok(resp) => tracing::warn!(username, status = %resp.status(), "User RSS feed returned error"),
+            Err(e) => tracing::error!(username, error = %e, "Failed to fetch user RSS feed"),
+        }
+    }
+
+    for slug in &pub_slugs {
+        let feed_url = format!("https://medium.com/feed/{}", slug);
+        let mut h = build_cookie_headers(sid, uid, cf_clearance);
+        h.insert(ACCEPT, HeaderValue::from_static("application/rss+xml, text/xml, */*"));
+        match client.get(&feed_url).headers(h).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(text) = resp.text().await {
+                    let items = parse_rss_items(&text);
+                    tracing::info!(slug, count = items.len(), "Fetched publication RSS feed");
+                    for (ts, title, url, author) in items {
+                        let clean = clean_rss_url(&url);
+                        if seen.insert(clean.clone()) {
+                            articles.push((ts, title, clean, author));
+                        }
+                    }
+                }
+            }
+            Ok(resp) => tracing::warn!(slug, status = %resp.status(), "Publication RSS feed returned error"),
+            Err(e) => tracing::error!(slug, error = %e, "Failed to fetch publication RSS feed"),
+        }
+    }
+
+    articles.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    let articles: Vec<(String, String, String, String)> = articles
+        .into_iter()
+        .map(|(ts, t, u, a)| (t, u, format_ts(ts), a))
+        .collect();
+
+    tracing::info!(total = articles.len(), "Feed fetch complete");
+    Ok(articles)
+}
+
+fn build_cookie_headers(sid: &str, uid: &str, cf_clearance: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(USER_AGENT, HeaderValue::from_static("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"));
+    headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
+
+    let mut cookie = String::new();
+    if !sid.is_empty() {
+        cookie.push_str(&format!("sid={}", sid));
+    }
+    if !uid.is_empty() {
+        if !cookie.is_empty() { cookie.push_str("; "); }
+        cookie.push_str(&format!("uid={}", uid));
+    }
+    if !cf_clearance.is_empty() {
+        if !cookie.is_empty() { cookie.push_str("; "); }
+        cookie.push_str(&format!("cf_clearance={}", cf_clearance));
+    }
+    if !cookie.is_empty() {
+        if let Ok(val) = HeaderValue::from_str(&cookie) {
+            headers.insert(reqwest::header::COOKIE, val);
+        }
+    }
+    headers
+}
+
 async fn perform_download(
     client: &reqwest::Client,
     url_str: &str,
     sid: &str,
     uid: &str,
+    cf_clearance: &str,
+    output_dir: &str,
+    force: bool,
     tx: &mpsc::UnboundedSender<AppEvent>,
 ) -> Result<String, String> {
-    let mut headers = HeaderMap::new();
-    headers.insert(USER_AGENT, HeaderValue::from_static("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"));
+    let slug = extract_slug(url_str);
+    let filename = format!("{}/{}.md", output_dir, slug);
+
+    if !force && tokio::fs::metadata(&filename).await.is_ok() {
+        tracing::info!(url = url_str, file = %filename, "Skipping — file already exists");
+        return Ok(format!("{} (skipped, already exists)", filename));
+    }
+
+    let mut headers = build_cookie_headers(sid, uid, cf_clearance);
     headers.insert(ACCEPT, HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8"));
-    headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
 
-    let mut cookie_header = String::new();
-    if !sid.is_empty() {
-        cookie_header.push_str(&format!("sid={}", sid));
-    }
-    if !uid.is_empty() {
-        if !cookie_header.is_empty() {
-            cookie_header.push_str("; ");
-        }
-        cookie_header.push_str(&format!("uid={}", uid));
-    }
-
-    if !cookie_header.is_empty() {
-        if let Ok(val) = HeaderValue::from_str(&cookie_header) {
-            headers.insert(reqwest::header::COOKIE, val);
-        }
-    }
+    tracing::info!(url = url_str, "Starting article download");
 
     let response = client
         .get(url_str)
         .headers(headers)
         .send()
         .await
-        .map_err(|e| format!("Network request failed: {}", e))?;
+        .map_err(|e| {
+            tracing::error!(url = url_str, error = %e, "Network request failed");
+            format!("Network request failed: {}", e)
+        })?;
 
     if !response.status().is_success() {
-        return Err(format!("HTTP Error: {}", response.status()));
+        let status = response.status();
+        tracing::error!(url = url_str, status = %status, "HTTP error");
+        return Err(format!("HTTP Error: {}", status));
     }
 
     let html_content = response
@@ -998,14 +1235,13 @@ async fn perform_download(
         .await
         .map_err(|e| format!("Failed to read response body: {}", e))?;
 
-    let slug = extract_slug(url_str);
-    let filename = format!("{}.md", slug);
-    let images_dir_name = format!("{}_images", slug);
+    let images_dir_basename = format!("{}_images", slug);
+    let images_dir_path = format!("{}/{}", output_dir, images_dir_basename);
 
     let (image_downloads, md_cleaned) = {
         let mut document = Html::parse_document(&html_content);
         
-        let image_downloads = clean_article_and_collect_images(&mut document, &images_dir_name)?;
+        let image_downloads = clean_article_and_collect_images(&mut document, &images_dir_basename)?;
 
         let article_selector = Selector::parse("article").unwrap();
         let cleaned_html = if let Some(article_ref) = document.select(&article_selector).next() {
@@ -1024,12 +1260,15 @@ async fn perform_download(
         .await
         .map_err(|e| format!("File write error: {}", e))?;
 
+    tracing::info!(url = url_str, file = %filename, "Article saved");
+
     if !image_downloads.is_empty() {
         let _ = tx.send(AppEvent::Log(format!("Downloading {} images...", image_downloads.len())));
-        if let Err(e) = tokio::fs::create_dir_all(&images_dir_name).await {
+        if let Err(e) = tokio::fs::create_dir_all(&images_dir_path).await {
             let _ = tx.send(AppEvent::Log(format!("Warning: Failed to create images directory: {}", e)));
         } else {
-            for (img_url, local_path) in image_downloads {
+            for (img_url, rel_path) in image_downloads {
+                let local_path = format!("{}/{}", output_dir, rel_path.trim_start_matches("./"));
                 let mut img_headers = HeaderMap::new();
                 img_headers.insert(USER_AGENT, HeaderValue::from_static("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"));
                 match client.get(&img_url).headers(img_headers).send().await {
@@ -1060,56 +1299,6 @@ async fn perform_download(
     Ok(filename)
 }
 
-fn draw_input_field(
-    rect: Rect,
-    f: &mut Frame,
-    title: &str,
-    value: &str,
-    cursor_pos: usize,
-    is_active: bool,
-) {
-    let style = if is_active {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Gray)
-    };
-
-    let border_type = if is_active {
-        BorderType::Double
-    } else {
-        BorderType::Plain
-    };
-
-    let block = Block::default()
-        .title(format!(" {} ", title))
-        .borders(Borders::ALL)
-        .border_style(style)
-        .border_type(border_type);
-
-    let inner_rect = block.inner(rect);
-    let width = inner_rect.width as usize;
-
-    let char_count = value.chars().count();
-    let (display_str, display_cursor) = if char_count <= width {
-        (value.to_string(), cursor_pos)
-    } else {
-        let start = cursor_pos.saturating_sub(width - 1);
-        let end = (start + width).min(char_count);
-        let chars: Vec<char> = value.chars().collect();
-        let s: String = chars[start..end].iter().collect();
-        (s, cursor_pos - start)
-    };
-
-    let paragraph = Paragraph::new(display_str).block(block);
-    f.render_widget(paragraph, rect);
-
-    if is_active {
-        f.set_cursor(
-            inner_rect.x + display_cursor as u16,
-            inner_rect.y,
-        );
-    }
-}
 
 fn draw_urls_field(
     rect: Rect,
@@ -1210,6 +1399,72 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
     .alignment(ratatui::layout::Alignment::Center);
     f.render_widget(title_p, chunks[0]);
 
+    if matches!(app.view, AppView::FeedSelector) {
+        let n_total = app.feed_articles.len();
+        let n_sel = app.feed_selected.iter().filter(|&&s| s).count();
+        let list_block = Block::default()
+            .title(format!(" Following Feed — {} articles, {} selected ", n_total, n_sel))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Magenta));
+
+        let inner = list_block.inner(chunks[1]);
+        let height = inner.height as usize;
+
+        if app.feed_cursor >= app.feed_scroll + height.max(1) {
+            app.feed_scroll = app.feed_cursor - height + 1;
+        }
+        if app.feed_cursor < app.feed_scroll {
+            app.feed_scroll = app.feed_cursor;
+        }
+
+        let start = app.feed_scroll;
+        let end = (start + height).min(n_total);
+
+        let items: Vec<ListItem> = app.feed_articles[start..end].iter().enumerate()
+            .map(|(rel, (title, url, date, author))| {
+                let abs = start + rel;
+                let checked = app.feed_selected.get(abs).copied().unwrap_or(false);
+                let slug = extract_slug(url);
+                let already_downloaded = std::fs::metadata(
+                    format!("{}/{}.md", app.output_dir, slug)
+                ).is_ok();
+                let prefix = if checked { "[x] " } else { "[ ] " };
+                let style = if abs == app.feed_cursor {
+                    Style::default().fg(Color::Black).bg(Color::Magenta).add_modifier(Modifier::BOLD)
+                } else if checked {
+                    Style::default().fg(Color::Green)
+                } else if already_downloaded {
+                    Style::default().fg(Color::Gray).add_modifier(Modifier::CROSSED_OUT)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                let date_part = if date.is_empty() { String::new() } else { format!("[{}] ", date) };
+                let author_part = if author.is_empty() { String::new() } else { format!(" — {}", author) };
+                ListItem::new(format!("{}{}{}{}", prefix, date_part, title, author_part)).style(style)
+            })
+            .collect();
+
+        let list = List::new(items).block(list_block);
+        f.render_widget(list, chunks[1]);
+
+        let footer_text = format!(
+            "  [Up/Down] Navigate | [Space] Toggle | [Enter] Load {} selected into downloader | [Esc/Ctrl+C] Quit",
+            n_sel
+        );
+        let footer_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::DarkGray));
+        let footer_p = Paragraph::new(Line::from(Span::styled(
+            footer_text,
+            Style::default().fg(Color::Black).bg(Color::Magenta),
+        )))
+        .block(footer_block);
+        f.render_widget(footer_p, chunks[2]);
+        return;
+    }
+
     match &mut app.view {
         AppView::Download => {
             let main_chunks = Layout::default()
@@ -1220,41 +1475,11 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
                 ])
                 .split(chunks[1]);
 
-            let input_chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3),
-                    Constraint::Length(3),
-                    Constraint::Min(4),
-                ])
-                .split(main_chunks[0]);
-
-            let sid_active = matches!(app.active_field, ActiveField::Sid);
-            draw_input_field(
-                input_chunks[0],
-                f,
-                "MEDIUM_SID (Session Cookie)",
-                &app.sid,
-                app.sid_cursor,
-                sid_active,
-            );
-
-            let uid_active = matches!(app.active_field, ActiveField::Uid);
-            draw_input_field(
-                input_chunks[1],
-                f,
-                "MEDIUM_UID (User Cookie - Optional)",
-                &app.uid,
-                app.uid_cursor,
-                uid_active,
-            );
-
-            let urls_active = matches!(app.active_field, ActiveField::Urls);
             draw_urls_field(
-                input_chunks[2],
+                main_chunks[0],
                 f,
                 app,
-                urls_active,
+                true,
             );
 
             let logs_block = Block::default()
@@ -1369,19 +1594,136 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
             let footer_p = Paragraph::new(Line::from(Span::styled(footer_text, status_style))).block(footer_block);
             f.render_widget(footer_p, chunks[2]);
         }
+        AppView::FeedSelector => unreachable!(),
     }
+}
+
+async fn setup_cookies() -> (String, String, String) {
+    let sid = std::env::var("MEDIUM_SID").unwrap_or_default();
+    let uid = std::env::var("MEDIUM_UID").unwrap_or_default();
+    let cf_clearance = std::env::var("MEDIUM_CF_CLEARANCE").unwrap_or_default();
+
+    let sid = if sid.is_empty() {
+        eprint!("MEDIUM_SID (session cookie): ");
+        rpassword::prompt_password("").unwrap_or_default()
+    } else {
+        sid
+    };
+
+    let cf_clearance = if cf_clearance.is_empty() {
+        eprint!("MEDIUM_CF_CLEARANCE (Cloudflare cookie): ");
+        rpassword::prompt_password("").unwrap_or_default()
+    } else {
+        cf_clearance
+    };
+
+    // Test cookies with a real request
+    let headers = build_cookie_headers(&sid, &uid, &cf_clearance);
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap_or_default();
+    match client.get("https://medium.com/me/feed").send().await {
+        Ok(resp) if resp.status().is_success() => {
+            eprintln!("Cookies OK ({})", resp.status());
+        }
+        Ok(resp) => {
+            eprintln!("Warning: cookie test returned {} — downloads may fail", resp.status());
+        }
+        Err(e) => {
+            eprintln!("Warning: cookie test failed: {} — continuing anyway", e);
+        }
+    }
+
+    (sid, uid, cf_clearance)
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("med2md — Download Medium articles as Markdown\n");
+        println!("USAGE:");
+        println!("  med2md                    Launch TUI downloader");
+        println!("  med2md --feed             Fetch your following feed and select articles to download");
+        println!("  med2md --dir <path>       Output directory for downloaded articles (default: ~/.medium)");
+        println!("  med2md --force            Re-download articles even if they already exist");
+        println!("  med2md --log <path>       Write JSON logs to <path> (default: medium.log)\n");
+        println!("ENVIRONMENT VARIABLES:");
+        println!("  MEDIUM_SID          Your Medium session cookie (required for member-only content)");
+        println!("  MEDIUM_UID          Your Medium user cookie (optional)");
+        println!("  MEDIUM_CF_CLEARANCE Cloudflare clearance cookie (required for --feed and most content)");
+        println!("  MEDIUM_DIR          Output directory for downloaded articles (default: ~/.medium)");
+        return Ok(());
+    }
+
+    let log_path = args.windows(2)
+        .find(|w| w[0] == "--log")
+        .map(|w| w[1].clone())
+        .unwrap_or_else(|| "medium.log".to_string());
+
+    let log_file = std::fs::File::create(&log_path)
+        .map_err(|e| format!("Failed to open log file {}: {}", log_path, e))?;
+    tracing_subscriber::fmt()
+        .json()
+        .with_writer(std::sync::Mutex::new(log_file))
+        .with_max_level(tracing::Level::INFO)
+        .with_target(false)
+        .try_init()
+        .ok();
+
+    tracing::info!(log = %log_path, "med2md started");
+
+    let (sid, uid, cf_clearance) = setup_cookies().await;
+
+    let output_dir = args.windows(2)
+        .find(|w| w[0] == "--dir")
+        .map(|w| w[1].clone())
+        .or_else(|| std::env::var("MEDIUM_DIR").ok())
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            format!("{}/.medium", home)
+        });
+
+    let feed_mode = args.iter().any(|a| a == "--feed");
+
+    let feed_articles = if feed_mode {
+        println!("Fetching your following feed...");
+        match fetch_following_feed(&sid, &uid, &cf_clearance).await {
+            Ok(articles) => {
+                println!("Found {} articles from followed users and publications.", articles.len());
+                articles
+            }
+            Err(e) => {
+                eprintln!("Warning: {}", e);
+                Vec::<(String, String, String, String)>::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new();
+    let force_download = args.iter().any(|a| a == "--force");
+
+    let mut app = App::new(sid, uid, cf_clearance, output_dir);
+    app.force_download = force_download;
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+
+    if feed_mode && !feed_articles.is_empty() {
+        let n = feed_articles.len();
+        app.feed_articles = feed_articles;
+        app.feed_selected = vec![false; n];
+        app.view = AppView::FeedSelector;
+    } else if feed_mode {
+        app.logs.push("Warning: No articles found. Check MEDIUM_SID and MEDIUM_CF_CLEARANCE.".to_string());
+    }
 
     loop {
         terminal.draw(|f| draw_ui(f, &mut app))?;
