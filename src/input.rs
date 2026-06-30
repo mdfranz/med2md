@@ -2,7 +2,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc;
 use crate::app::{App, AppView, AppEvent};
 use crate::util::{get_char_byte_index, get_jitter_ms};
-use crate::markdown::load_preview_lines;
+use crate::app::PickerPane;
+use crate::markdown::load_preview_content;
 use crate::articles::fetch_rss_for_authors;
 use crate::net::perform_download;
 
@@ -278,29 +279,49 @@ pub fn handle_key(
         AppView::Picker {
             files,
             selected_idx,
-            preview_lines,
+            preview_content,
             preview_scroll_y,
+            active_pane,
+            preview_height,
         } => {
             match key.code {
-                KeyCode::Up => {
-                    if !files.is_empty() && *selected_idx > 0 {
-                        *selected_idx -= 1;
-                        *preview_lines = load_preview_lines(&files[*selected_idx]);
-                        *preview_scroll_y = 0;
+                KeyCode::Tab => {
+                    *active_pane = match active_pane {
+                        PickerPane::Files => PickerPane::Preview,
+                        PickerPane::Preview => PickerPane::Files,
+                    };
+                }
+                KeyCode::Up | KeyCode::Char('k') => match active_pane {
+                    PickerPane::Files => {
+                        if !files.is_empty() && *selected_idx > 0 {
+                            *selected_idx -= 1;
+                            *preview_content = load_preview_content(&files[*selected_idx]);
+                            *preview_scroll_y = 0;
+                        }
                     }
-                }
-                KeyCode::Down => {
-                    if !files.is_empty() && *selected_idx + 1 < files.len() {
-                        *selected_idx += 1;
-                        *preview_lines = load_preview_lines(&files[*selected_idx]);
-                        *preview_scroll_y = 0;
+                    PickerPane::Preview => {
+                        *preview_scroll_y = preview_scroll_y.saturating_sub(1);
                     }
+                },
+                KeyCode::Down | KeyCode::Char('j') => match active_pane {
+                    PickerPane::Files => {
+                        if !files.is_empty() && *selected_idx + 1 < files.len() {
+                            *selected_idx += 1;
+                            *preview_content = load_preview_content(&files[*selected_idx]);
+                            *preview_scroll_y = 0;
+                        }
+                    }
+                    PickerPane::Preview => {
+                        *preview_scroll_y += 1;
+                    }
+                },
+                KeyCode::PageUp | KeyCode::Char('w') => {
+                    let step = (*preview_height).max(1).saturating_sub(1);
+                    *preview_scroll_y = preview_scroll_y.saturating_sub(step);
                 }
-                KeyCode::PageUp | KeyCode::Char('w') | KeyCode::Char('k') => {
-                    *preview_scroll_y = preview_scroll_y.saturating_sub(1);
-                }
-                KeyCode::PageDown | KeyCode::Char('s') | KeyCode::Char('j') => {
-                    *preview_scroll_y += 1;
+                KeyCode::PageDown | KeyCode::Char('s') => {
+                    let step = (*preview_height).max(1).saturating_sub(1);
+                    *preview_scroll_y += step;
                 }
                 _ => {}
             }
@@ -333,12 +354,14 @@ pub fn enter_picker_view(app: &mut App) {
         return;
     }
 
-    let preview_lines = load_preview_lines(&files[0]);
+    let preview_content = load_preview_content(&files[0]);
     app.view = AppView::Picker {
         files,
         selected_idx: 0,
-        preview_lines,
+        preview_content,
         preview_scroll_y: 0,
+        active_pane: PickerPane::Files,
+        preview_height: 0,
     };
 }
 

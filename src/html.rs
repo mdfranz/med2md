@@ -2,6 +2,25 @@ use scraper::{Html, Selector};
 use markup5ever::{QualName, Namespace, LocalName};
 use crate::util::get_extension;
 
+pub fn inject_source_link(md: &str, url: &str) -> String {
+    let mut result = String::new();
+    let mut injected = false;
+    for line in md.lines() {
+        if !injected && line.starts_with("# ") {
+            let title = &line[2..];
+            result.push_str(&format!("# [{}]({})\n", title, url));
+            injected = true;
+        } else {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+    if !injected {
+        result = format!("[Source]({})\n\n{}", url, result);
+    }
+    result.trim_end().to_string()
+}
+
 pub fn clean_markdown(md_text: &str) -> String {
     let lines = md_text.lines();
     let mut cleaned_lines = Vec::new();

@@ -37,6 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  med2md --feed             Fetch your following feed and select articles to download");
         println!("  med2md --authors          Browse followed authors, select, then fetch their articles");
         println!("  med2md --dir <path>       Output directory for downloaded articles (default: ~/.medium)");
+        println!("  med2md --browse           Browse already-downloaded markdown files");
         println!("  med2md --force            Re-download articles even if they already exist");
         println!("  med2md --log <path>       Write JSON logs to <path> (default: medium.log)\n");
         println!("ENVIRONMENT VARIABLES:");
@@ -82,6 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let feed_mode = args.iter().any(|a| a == "--feed");
     let authors_mode = args.iter().any(|a| a == "--authors");
+    let browse_mode = args.iter().any(|a| a == "--browse");
 
     let mut initial_feed_articles: Vec<(String, String, String, String)> = Vec::new();
     let mut initial_authors: Vec<(String, String)> = Vec::new();
@@ -135,6 +137,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         app.view = AppView::FeedSelector;
     } else if feed_mode {
         app.log("Warning: No articles found. Check MEDIUM_SID and MEDIUM_CF_CLEARANCE.".to_string());
+    } else if browse_mode {
+        enter_picker_view(&mut app);
     }
 
     loop {

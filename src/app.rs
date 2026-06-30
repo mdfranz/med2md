@@ -1,12 +1,17 @@
-use ratatui::text::Line;
+pub enum PickerPane {
+    Files,
+    Preview,
+}
 
 pub enum AppView {
     Download,
     Picker {
         files: Vec<String>,
         selected_idx: usize,
-        preview_lines: Vec<Line<'static>>,
+        preview_content: String,
         preview_scroll_y: usize,
+        active_pane: PickerPane,
+        preview_height: usize,
     },
     FeedSelector,
     AuthorBrowser {

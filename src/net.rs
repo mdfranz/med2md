@@ -3,7 +3,7 @@ use scraper::{Html, Selector};
 use tokio::sync::mpsc;
 use crate::app::AppEvent;
 use crate::util::{extract_slug, get_jitter_ms};
-use crate::html::{clean_article_and_collect_images, clean_markdown};
+use crate::html::{clean_article_and_collect_images, clean_markdown, inject_source_link};
 
 pub fn build_cookie_headers(sid: &str, uid: &str, cf_clearance: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -91,8 +91,9 @@ pub async fn perform_download(
 
         let md = html2md::parse_html(&cleaned_html);
         let md_cleaned = clean_markdown(&md);
+        let md_with_link = inject_source_link(&md_cleaned, url_str);
 
-        (image_downloads, md_cleaned)
+        (image_downloads, md_with_link)
     };
 
     tokio::fs::write(&filename, md_cleaned)

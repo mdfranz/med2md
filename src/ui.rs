@@ -2,9 +2,10 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, List, ListItem, Paragraph},
+    widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap},
     Frame,
 };
+use crate::app::PickerPane;
 use crate::app::{App, AppView};
 use crate::util::extract_slug;
 
@@ -68,15 +69,15 @@ pub fn draw_urls_field(
     if is_active {
         let screen_y = app.cursor_y.saturating_sub(app.urls_scroll_y);
         let screen_x = app.cursor_x.min(width);
-        f.set_cursor(
+        f.set_cursor_position((
             inner_rect.x + screen_x as u16,
             inner_rect.y + screen_y as u16,
-        );
+        ));
     }
 }
 
 pub fn draw_ui(f: &mut Frame, app: &mut App) {
-    let size = f.size();
+    let size = f.area();
 
     if size.width < 20 || size.height < 10 {
         f.render_widget(
@@ -324,8 +325,10 @@ pub fn draw_ui(f: &mut Frame, app: &mut App) {
         AppView::Picker {
             files,
             selected_idx,
-            preview_lines,
+            preview_content,
             preview_scroll_y,
+            active_pane,
+            preview_height,
         } => {
             let picker_chunks = Layout::default()
                 .direction(Direction::Horizontal)
@@ -335,11 +338,12 @@ pub fn draw_ui(f: &mut Frame, app: &mut App) {
                 ])
                 .split(chunks[1]);
 
+            let files_active = matches!(active_pane, PickerPane::Files);
             let file_list_block = Block::default()
                 .title(" Markdown Files ")
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Yellow));
+                .border_type(if files_active { BorderType::Double } else { BorderType::Rounded })
+                .border_style(Style::default().fg(if files_active { Color::Yellow } else { Color::DarkGray }));
 
             let list_items: Vec<ListItem> = files
                 .iter()
@@ -353,10 +357,14 @@ pub fn draw_ui(f: &mut Frame, app: &mut App) {
                     } else {
                         Style::default().fg(Color::White)
                     };
+                    let fname = std::path::Path::new(name)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(name);
                     let display_name = if idx == *selected_idx {
-                        format!(" > {}", name)
+                        format!(" > {}", fname)
                     } else {
-                        format!("   {}", name)
+                        format!("   {}", fname)
                     };
                     ListItem::new(display_name).style(style)
                 })
@@ -365,30 +373,28 @@ pub fn draw_ui(f: &mut Frame, app: &mut App) {
             let file_list = List::new(list_items).block(file_list_block);
             f.render_widget(file_list, picker_chunks[0]);
 
+            let preview_active = matches!(active_pane, PickerPane::Preview);
             let preview_block = Block::default()
                 .title(format!(" Preview: {} ", files.get(*selected_idx).cloned().unwrap_or_default()))
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Green));
+                .border_type(if preview_active { BorderType::Double } else { BorderType::Rounded })
+                .border_style(Style::default().fg(if preview_active { Color::Green } else { Color::DarkGray }));
 
             let inner_preview_rect = preview_block.inner(picker_chunks[1]);
-            let preview_height = inner_preview_rect.height as usize;
+            *preview_height = inner_preview_rect.height as usize;
 
-            let max_scroll = preview_lines.len().saturating_sub(preview_height);
-            let scroll_y = (*preview_scroll_y).min(max_scroll);
+            let text = tui_markdown::from_str(preview_content);
+            let max_scroll = text.lines.len().saturating_sub(*preview_height);
+            *preview_scroll_y = (*preview_scroll_y).min(max_scroll);
 
-            let display_lines = if preview_lines.is_empty() {
-                vec![Line::from(Span::styled("Empty file.", Style::default().fg(Color::DarkGray)))]
-            } else {
-                let end = (scroll_y + preview_height).min(preview_lines.len());
-                preview_lines[scroll_y..end].to_vec()
-            };
-
-            let preview_p = Paragraph::new(display_lines).block(preview_block);
+            let preview_p = Paragraph::new(text)
+                .block(preview_block)
+                .wrap(Wrap { trim: false })
+                .scroll((*preview_scroll_y as u16, 0));
             f.render_widget(preview_p, picker_chunks[1]);
 
             let status_style = Style::default().fg(Color::Black).bg(Color::Yellow);
-            let footer_text = "  [Up/Down] Select File | [W/S] or [K/J] Scroll Preview | [Ctrl+P] Back to Downloader | [Esc] Exit";
+            let footer_text = "  [Tab] Switch Pane | [↑↓/j/k] Navigate/Scroll | [PgUp/PgDn/w/s] Page Scroll | [Ctrl+P] Back | [Esc] Exit";
             let footer_block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(Color::DarkGray));
             let footer_p = Paragraph::new(Line::from(Span::styled(footer_text, status_style))).block(footer_block);
             f.render_widget(footer_p, chunks[2]);
