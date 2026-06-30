@@ -459,15 +459,15 @@ fn parse_markdown_to_lines(content: &str) -> Vec<Line<'static>> {
         }
         if trimmed.starts_with("## ") {
             let text = trimmed[3..].to_string();
-            let style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+            let style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
             lines.push(Line::from(Span::raw("")));
             lines.push(Line::from(Span::styled(text, style)));
-            lines.push(Line::from(Span::styled("----------------------------------------", Style::default().fg(Color::Cyan))));
+            lines.push(Line::from(Span::styled("----------------------------------------", Style::default().fg(Color::White))));
             continue;
         }
         if trimmed.starts_with("### ") {
             let text = trimmed[4..].to_string();
-            let style = Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD);
+            let style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
             lines.push(Line::from(Span::raw("")));
             lines.push(Line::from(Span::styled(text, style)));
             continue;
@@ -1390,7 +1390,7 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
     let title_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(Color::White));
     let title_p = Paragraph::new(Line::from(vec![
         Span::styled(" 📚 Medium Article Markdown Downloader ", Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow)),
         Span::raw(" (Rust TUI Edition)"),
@@ -1406,7 +1406,7 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
             .title(format!(" Following Feed — {} articles, {} selected ", n_total, n_sel))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Magenta));
+            .border_style(Style::default().fg(Color::White));
 
         let inner = list_block.inner(chunks[1]);
         let height = inner.height as usize;
@@ -1431,7 +1431,7 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
                 ).is_ok();
                 let prefix = if checked { "[x] " } else { "[ ] " };
                 let style = if abs == app.feed_cursor {
-                    Style::default().fg(Color::Black).bg(Color::Magenta).add_modifier(Modifier::BOLD)
+                    Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::BOLD)
                 } else if checked {
                     Style::default().fg(Color::Green)
                 } else if already_downloaded {
@@ -1458,7 +1458,7 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
             .border_style(Style::default().fg(Color::DarkGray));
         let footer_p = Paragraph::new(Line::from(Span::styled(
             footer_text,
-            Style::default().fg(Color::Black).bg(Color::Magenta),
+            Style::default().fg(Color::Black).bg(Color::White),
         )))
         .block(footer_block);
         f.render_widget(footer_p, chunks[2]);
@@ -1502,7 +1502,7 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
                     } else if log.contains("Warning") {
                         Line::from(Span::styled(log, Style::default().fg(Color::Yellow)))
                     } else if log.starts_with('[') {
-                        Line::from(Span::styled(log, Style::default().fg(Color::Cyan)))
+                        Line::from(Span::styled(log, Style::default().fg(Color::White)))
                     } else {
                         Line::from(Span::raw(log))
                     }
@@ -1512,7 +1512,7 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
             let logs_p = Paragraph::new(log_lines).block(logs_block);
             f.render_widget(logs_p, main_chunks[1]);
 
-            let status_style = Style::default().fg(Color::Black).bg(Color::Cyan);
+            let status_style = Style::default().fg(Color::Black).bg(Color::White);
             let footer_text = if app.is_downloading {
                 "  📥 Downloading... Please wait. Ctrl+C to Force Quit."
             } else {
