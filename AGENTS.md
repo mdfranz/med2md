@@ -5,4 +5,4 @@
 
 # Git Guidance
 - You may commit local changes, creating terse commit messages
-- NEVER push to origin
+- NEVER push to origin or remotes

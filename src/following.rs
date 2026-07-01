@@ -3,10 +3,46 @@ use crate::net::build_cookie_headers;
 use crate::feed::{parse_medium_api_json, clean_rss_url, parse_rss_items, extract_following_from_html};
 use crate::util::{get_jitter_ms, format_ts};
 
+enum RssFetch {
+    Body(String),
+    RateLimited,
+    Failed,
+}
+
+async fn fetch_rss_with_retry(
+    client: &reqwest::Client,
+    url: &str,
+    headers: reqwest::header::HeaderMap,
+) -> RssFetch {
+    let resp = match client.get(url).headers(headers.clone()).send().await {
+        Ok(r) => r,
+        Err(e) => { tracing::error!(url, error = %e, "RSS fetch failed"); return RssFetch::Failed; }
+    };
+    if resp.status().is_success() {
+        return resp.text().await.map(RssFetch::Body).unwrap_or(RssFetch::Failed);
+    }
+    if resp.status().as_u16() == 429 {
+        let wait_secs: u64 = resp.headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60);
+        tracing::warn!(url, wait_secs, "RSS rate limited (429), backing off");
+        tokio::time::sleep(tokio::time::Duration::from_secs(wait_secs)).await;
+        return match client.get(url).headers(headers).send().await {
+            Ok(r) if r.status().is_success() => r.text().await.map(RssFetch::Body).unwrap_or(RssFetch::Failed),
+            _ => { tracing::warn!(url, "RSS still rate limited after retry, skipping"); RssFetch::RateLimited }
+        };
+    }
+    tracing::warn!(url, status = %resp.status(), "RSS fetch returned error");
+    RssFetch::Failed
+}
+
 pub async fn fetch_following_feed(
     sid: &str,
     uid: &str,
     cf_clearance: &str,
+    known_authors: &[(String, String)],
 ) -> Result<Vec<(String, String, String, String)>, String> {
     let client = reqwest::Client::builder()
         .build()
@@ -81,7 +117,28 @@ pub async fn fetch_following_feed(
     };
 
     tracing::info!(source = feed_url_used, "Parsing Apollo state");
-    let (usernames, pub_slugs, apollo_posts) = extract_following_from_html(&html);
+    let (apollo_usernames, apollo_pub_slugs, apollo_posts) = extract_following_from_html(&html);
+
+    // Use the pre-fetched following list when available; fall back to Apollo extraction
+    let (usernames, pub_slugs): (Vec<String>, Vec<String>) = if !known_authors.is_empty() {
+        tracing::info!(count = known_authors.len(), "Using known authors list for RSS fetching");
+        let users = known_authors.iter()
+            .filter(|(k, _)| k == "user")
+            .map(|(_, n)| n.clone())
+            .collect();
+        let pubs = known_authors.iter()
+            .filter(|(k, _)| k == "pub")
+            .map(|(_, n)| n.clone())
+            .collect();
+        (users, pubs)
+    } else {
+        tracing::info!(
+            users = apollo_usernames.len(),
+            publications = apollo_pub_slugs.len(),
+            "No known authors list; using Apollo state extraction"
+        );
+        (apollo_usernames, apollo_pub_slugs)
+    };
 
     if usernames.is_empty() && pub_slugs.is_empty() && apollo_posts.is_empty() {
         let err_msg = "No followed users or publications found. Check your MEDIUM_SID and MEDIUM_CF_CLEARANCE.";
@@ -106,53 +163,59 @@ pub async fn fetch_following_feed(
         }
     }
 
+    let mut inter_delay_ms: u64 = 1500;
+
     for (idx, username) in usernames.iter().enumerate() {
         if idx > 0 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(get_jitter_ms(250))).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(get_jitter_ms(inter_delay_ms))).await;
         }
         let feed_url = format!("https://medium.com/feed/@{}", username);
         let mut h = build_cookie_headers(sid, uid, cf_clearance);
         h.insert(ACCEPT, HeaderValue::from_static("application/rss+xml, text/xml, */*"));
-        match client.get(&feed_url).headers(h).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                if let Ok(text) = resp.text().await {
-                    let items = parse_rss_items(&text);
-                    tracing::info!(username, count = items.len(), "Fetched user RSS feed");
-                    for (ts, title, url, author) in items {
-                        let clean = clean_rss_url(&url);
-                        if seen.insert(clean.clone()) {
-                            articles.push((ts, title, clean, author));
-                        }
+        match fetch_rss_with_retry(&client, &feed_url, h).await {
+            RssFetch::Body(text) => {
+                let items = parse_rss_items(&text);
+                tracing::info!(username, count = items.len(), "Fetched user RSS feed");
+                for (ts, title, url, author) in items {
+                    let clean = clean_rss_url(&url);
+                    if seen.insert(clean.clone()) {
+                        articles.push((ts, title, clean, author));
                     }
                 }
+                inter_delay_ms = inter_delay_ms.max(1500);
             }
-            Ok(resp) => tracing::warn!(username, status = %resp.status(), "User RSS feed returned error"),
-            Err(e) => tracing::error!(username, error = %e, "Failed to fetch user RSS feed"),
+            RssFetch::RateLimited => {
+                tracing::warn!(username, "User RSS still rate limited, increasing inter-request delay");
+                inter_delay_ms = (inter_delay_ms * 2).min(8000);
+            }
+            RssFetch::Failed => {}
         }
     }
 
     for (idx, slug) in pub_slugs.iter().enumerate() {
         if !usernames.is_empty() || idx > 0 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(get_jitter_ms(250))).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(get_jitter_ms(inter_delay_ms))).await;
         }
         let feed_url = format!("https://medium.com/feed/{}", slug);
         let mut h = build_cookie_headers(sid, uid, cf_clearance);
         h.insert(ACCEPT, HeaderValue::from_static("application/rss+xml, text/xml, */*"));
-        match client.get(&feed_url).headers(h).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                if let Ok(text) = resp.text().await {
-                    let items = parse_rss_items(&text);
-                    tracing::info!(slug, count = items.len(), "Fetched publication RSS feed");
-                    for (ts, title, url, author) in items {
-                        let clean = clean_rss_url(&url);
-                        if seen.insert(clean.clone()) {
-                            articles.push((ts, title, clean, author));
-                        }
+        match fetch_rss_with_retry(&client, &feed_url, h).await {
+            RssFetch::Body(text) => {
+                let items = parse_rss_items(&text);
+                tracing::info!(slug, count = items.len(), "Fetched publication RSS feed");
+                for (ts, title, url, author) in items {
+                    let clean = clean_rss_url(&url);
+                    if seen.insert(clean.clone()) {
+                        articles.push((ts, title, clean, author));
                     }
                 }
+                inter_delay_ms = inter_delay_ms.max(1500);
             }
-            Ok(resp) => tracing::warn!(slug, status = %resp.status(), "Publication RSS feed returned error"),
-            Err(e) => tracing::error!(slug, error = %e, "Failed to fetch publication RSS feed"),
+            RssFetch::RateLimited => {
+                tracing::warn!(slug, "Publication RSS still rate limited, increasing inter-request delay");
+                inter_delay_ms = (inter_delay_ms * 2).min(8000);
+            }
+            RssFetch::Failed => {}
         }
     }
 

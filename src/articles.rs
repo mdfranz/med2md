@@ -3,6 +3,35 @@ use crate::net::build_cookie_headers;
 use crate::feed::{parse_medium_api_json, clean_rss_url, parse_rss_items, extract_following_from_html, extract_user_id_from_apollo};
 use crate::util::{get_jitter_ms, format_ts};
 
+async fn fetch_rss_with_retry(
+    client: &reqwest::Client,
+    url: &str,
+    headers: reqwest::header::HeaderMap,
+) -> Option<String> {
+    let resp = match client.get(url).headers(headers.clone()).send().await {
+        Ok(r) => r,
+        Err(e) => { tracing::error!(url, error = %e, "RSS fetch failed"); return None; }
+    };
+    if resp.status().is_success() {
+        return resp.text().await.ok();
+    }
+    if resp.status().as_u16() == 429 {
+        let wait_secs: u64 = resp.headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60);
+        tracing::warn!(url, wait_secs, "RSS rate limited (429), backing off");
+        tokio::time::sleep(tokio::time::Duration::from_secs(wait_secs)).await;
+        return match client.get(url).headers(headers).send().await {
+            Ok(r) if r.status().is_success() => r.text().await.ok(),
+            _ => { tracing::warn!(url, "RSS still rate limited after retry, skipping"); None }
+        };
+    }
+    tracing::warn!(url, status = %resp.status(), "RSS fetch returned error");
+    None
+}
+
 pub async fn fetch_user_posts_api(
     client: &reqwest::Client,
     sid: &str,
@@ -90,9 +119,11 @@ pub async fn fetch_rss_for_authors(
     let mut articles: Vec<(i64, String, String, String)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
+    let mut inter_delay_ms: u64 = 1500;
+
     for (idx, (kind, name)) in authors.iter().enumerate() {
         if idx > 0 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(get_jitter_ms(300))).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(get_jitter_ms(inter_delay_ms))).await;
         }
 
         let feed_url = if kind == "user" {
@@ -102,22 +133,23 @@ pub async fn fetch_rss_for_authors(
         };
         let mut h = build_cookie_headers(sid, uid, cf_clearance);
         h.insert(ACCEPT, HeaderValue::from_static("application/rss+xml, text/xml, */*"));
-        match client.get(&feed_url).headers(h).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                if let Ok(text) = resp.text().await {
-                    let items = parse_rss_items(&text);
-                    tracing::info!(name, rss = items.len(), "Fetched author RSS");
-                    for (ts, title, url, author) in items {
-                        let clean = clean_rss_url(&url);
-                        if seen.insert(clean.clone()) {
-                            articles.push((ts, title, clean, author));
-                        }
-                    }
+        let rss_ok = if let Some(text) = fetch_rss_with_retry(&client, &feed_url, h).await {
+            let items = parse_rss_items(&text);
+            tracing::info!(name, rss = items.len(), "Fetched author RSS");
+            for (ts, title, url, author) in items {
+                let clean = clean_rss_url(&url);
+                if seen.insert(clean.clone()) {
+                    articles.push((ts, title, clean, author));
                 }
             }
-            Ok(resp) => tracing::warn!(name, status = %resp.status(), "Author RSS error"),
-            Err(e) => tracing::error!(name, error = %e, "Failed to fetch author RSS"),
-        }
+            inter_delay_ms = inter_delay_ms.max(1500);
+            true
+        } else {
+            inter_delay_ms = (inter_delay_ms * 2).min(8000);
+            false
+        };
+
+        if !rss_ok { continue; }
 
         if kind == "user" {
             tokio::time::sleep(tokio::time::Duration::from_millis(get_jitter_ms(250))).await;

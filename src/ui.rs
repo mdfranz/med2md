@@ -5,9 +5,8 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap},
     Frame,
 };
-use crate::app::PickerPane;
-use crate::app::{App, AppView};
-use crate::util::extract_slug;
+use crate::app::{compute_display_order, App, AppView, AuthorSort, PickerPane};
+use crate::util::{extract_slug, format_date};
 
 pub fn draw_urls_field(
     rect: Rect,
@@ -158,7 +157,7 @@ pub fn draw_ui(f: &mut Frame, app: &mut App) {
         f.render_widget(list, chunks[1]);
 
         let footer_text = format!(
-            "  [Up/Down] Navigate | [Space] Toggle | [Enter] Load {} selected into downloader | [Esc/Ctrl+C] Quit",
+            "  [Up/Down] Navigate | [Space] Toggle | [Enter] Load {} selected | [R] Refresh | [Esc/Ctrl+C] Quit",
             n_sel
         );
         let footer_block = Block::default()
@@ -177,8 +176,25 @@ pub fn draw_ui(f: &mut Frame, app: &mut App) {
     if let AppView::AuthorBrowser { authors, selected, cursor, scroll } = &mut app.view {
         let n_total = authors.len();
         let n_sel = selected.iter().filter(|&&s| s).count();
+        let n_enriched = app.author_meta.len();
+        let sort_label = match app.author_sort {
+            AuthorSort::Alpha => "A-Z",
+            AuthorSort::LastPost => "Last Post",
+        };
+        let loading_suffix = if n_enriched < n_total {
+            if let Some(secs) = app.enrichment_throttle {
+                format!(" — rate limited, retrying in {}s ({}/{})", secs, n_enriched, n_total)
+            } else {
+                format!(" — loading {}/{}", n_enriched, n_total)
+            }
+        } else {
+            String::new()
+        };
         let list_block = Block::default()
-            .title(format!(" Followed Authors & Publications — {}, {} selected ", n_total, n_sel))
+            .title(format!(
+                " Authors & Publications — {}, {} selected | Sort: {}{} ",
+                n_total, n_sel, sort_label, loading_suffix
+            ))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::Cyan));
@@ -193,18 +209,25 @@ pub fn draw_ui(f: &mut Frame, app: &mut App) {
             *scroll = *cursor;
         }
 
+        let display_order = compute_display_order(authors, &app.author_meta, &app.author_sort);
         let start = *scroll;
         let end = (start + height).min(n_total);
 
-        let items: Vec<ListItem> = authors[start..end].iter().enumerate()
-            .map(|(rel, (kind, name))| {
+        let items: Vec<ListItem> = display_order[start..end].iter().enumerate()
+            .map(|(rel, &author_idx)| {
                 let abs = start + rel;
-                let checked = selected.get(abs).copied().unwrap_or(false);
+                let (kind, name) = &authors[author_idx];
+                let checked = selected.get(author_idx).copied().unwrap_or(false);
                 let prefix = if checked { "[x] " } else { "[ ] " };
                 let label = if kind == "user" {
                     format!("@{}", name)
                 } else {
                     format!("pub: {}", name)
+                };
+                let meta_str = match app.author_meta.get(name) {
+                    Some((ts, count)) if *ts > 0 => format!("  {} ({})", format_date(*ts), count),
+                    Some(_) => "  no posts".to_string(),
+                    None => "  ...".to_string(),
                 };
                 let style = if abs == *cursor {
                     Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
@@ -213,7 +236,7 @@ pub fn draw_ui(f: &mut Frame, app: &mut App) {
                 } else {
                     Style::default().fg(Color::White)
                 };
-                ListItem::new(format!("{}{}", prefix, label)).style(style)
+                ListItem::new(format!("{}{}{}", prefix, label, meta_str)).style(style)
             })
             .collect();
 
@@ -221,7 +244,7 @@ pub fn draw_ui(f: &mut Frame, app: &mut App) {
         f.render_widget(list, chunks[1]);
 
         let footer_text = format!(
-            "  [↑↓] Navigate  [Space] Toggle  [A] Select All  [Enter] Fetch {} selected  [Esc/Ctrl+C] Quit",
+            "  [↑↓] Navigate  [Space] Toggle  [A] All  [S] Sort  [Enter] Fetch {} selected  [Esc] Back  [Ctrl+C] Quit",
             n_sel
         );
         let footer_block = Block::default()
@@ -325,10 +348,11 @@ pub fn draw_ui(f: &mut Frame, app: &mut App) {
         AppView::Picker {
             files,
             selected_idx,
-            preview_content,
+            preview_lines,
             preview_scroll_y,
             active_pane,
             preview_height,
+            ..
         } => {
             let picker_chunks = Layout::default()
                 .direction(Direction::Horizontal)
@@ -383,11 +407,10 @@ pub fn draw_ui(f: &mut Frame, app: &mut App) {
             let inner_preview_rect = preview_block.inner(picker_chunks[1]);
             *preview_height = inner_preview_rect.height as usize;
 
-            let text = tui_markdown::from_str(preview_content);
-            let max_scroll = text.lines.len().saturating_sub(*preview_height);
+            let max_scroll = preview_lines.len().saturating_sub(*preview_height);
             *preview_scroll_y = (*preview_scroll_y).min(max_scroll);
 
-            let preview_p = Paragraph::new(text)
+            let preview_p = Paragraph::new(preview_lines.clone())
                 .block(preview_block)
                 .wrap(Wrap { trim: false })
                 .scroll((*preview_scroll_y as u16, 0));

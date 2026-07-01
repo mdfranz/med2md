@@ -37,6 +37,14 @@ pub fn format_ts(ts: i64) -> String {
     }
 }
 
+pub fn format_date(ts: i64) -> String {
+    if ts == 0 { return String::new(); }
+    match chrono::DateTime::from_timestamp(ts, 0) {
+        Some(dt) => dt.format("%Y-%m-%d").to_string(),
+        None => String::new(),
+    }
+}
+
 pub fn get_jitter_ms(base_ms: u64) -> u64 {
     use std::time::SystemTime;
     let nanos = SystemTime::now()

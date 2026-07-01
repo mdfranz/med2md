@@ -2,9 +2,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc;
 use crate::app::{App, AppView, AppEvent};
 use crate::util::{get_char_byte_index, get_jitter_ms};
-use crate::app::PickerPane;
-use crate::markdown::load_preview_content;
+use crate::app::{compute_display_order, AuthorSort, PickerPane};
+use crate::markdown::{load_preview_content, render_markdown};
 use crate::articles::fetch_rss_for_authors;
+use crate::following::fetch_following_feed;
 use crate::net::perform_download;
 
 pub fn handle_multiline_key(app: &mut App, key: KeyEvent) {
@@ -128,8 +129,15 @@ pub fn handle_paste(app: &mut App, text: &str) {
     handle_paste_urls(app, &text.replace('\r', ""));
 }
 
-pub fn handle_feed_selector_key(app: &mut App, key: KeyEvent) -> bool {
-    if key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) {
+pub fn handle_feed_selector_key(app: &mut App, key: KeyEvent, tx: mpsc::UnboundedSender<AppEvent>) -> bool {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return true;
+    }
+    if key.code == KeyCode::Esc {
+        if let Some((authors, selected)) = app.prev_authors.take() {
+            app.view = AppView::AuthorBrowser { authors, selected, cursor: 0, scroll: 0 };
+            return false;
+        }
         return true;
     }
     match key.code {
@@ -147,6 +155,30 @@ pub fn handle_feed_selector_key(app: &mut App, key: KeyEvent) -> bool {
             if app.feed_cursor < app.feed_selected.len() {
                 app.feed_selected[app.feed_cursor] = !app.feed_selected[app.feed_cursor];
             }
+        }
+        KeyCode::Char('r') => {
+            let sid = app.sid.clone();
+            let uid = app.uid.clone();
+            let cf_clearance = app.cf_clearance.clone();
+            let authors = app.following_authors.clone();
+            let cache_dir = format!("{}/.cache", app.output_dir);
+            let fallback = app.feed_articles.clone();
+            let n = authors.len();
+            app.view = AppView::Loading {
+                message: format!("Refreshing feed ({} authors)...", n),
+            };
+            tokio::spawn(async move {
+                match fetch_following_feed(&sid, &uid, &cf_clearance, &authors).await {
+                    Ok(articles) => {
+                        crate::cache::write_feed_cache(&cache_dir, &articles);
+                        let _ = tx.send(AppEvent::FeedReady(articles));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::Log(format!("Refresh error: {}", e)));
+                        let _ = tx.send(AppEvent::FeedReady(fallback));
+                    }
+                }
+            });
         }
         KeyCode::Enter => {
             let urls: Vec<String> = app.feed_articles.iter().enumerate()
@@ -181,15 +213,30 @@ pub fn handle_author_browser_key(app: &mut App, key: KeyEvent, tx: mpsc::Unbound
             }
         }
         KeyCode::Char(' ') => {
+            let display_order = if let AppView::AuthorBrowser { authors, .. } = &app.view {
+                compute_display_order(authors, &app.author_meta, &app.author_sort)
+            } else { return false; };
             if let AppView::AuthorBrowser { cursor, selected, .. } = &mut app.view {
                 let c = *cursor;
-                if c < selected.len() { selected[c] = !selected[c]; }
+                if c < display_order.len() {
+                    let real = display_order[c];
+                    if real < selected.len() { selected[real] = !selected[real]; }
+                }
             }
         }
         KeyCode::Char('a') => {
             if let AppView::AuthorBrowser { selected, .. } = &mut app.view {
                 let all = selected.iter().all(|&s| s);
                 for s in selected.iter_mut() { *s = !all; }
+            }
+        }
+        KeyCode::Char('s') => {
+            app.author_sort = match app.author_sort {
+                AuthorSort::Alpha => AuthorSort::LastPost,
+                AuthorSort::LastPost => AuthorSort::Alpha,
+            };
+            if let AppView::AuthorBrowser { cursor, .. } = &mut app.view {
+                *cursor = 0;
             }
         }
         KeyCode::Enter => {
@@ -202,6 +249,9 @@ pub fn handle_author_browser_key(app: &mut App, key: KeyEvent, tx: mpsc::Unbound
                 return false;
             };
             if selected_authors.is_empty() { return false; }
+            if let AppView::AuthorBrowser { authors, selected, .. } = &app.view {
+                app.prev_authors = Some((authors.clone(), selected.clone()));
+            }
             let sid = app.sid.clone();
             let uid = app.uid.clone();
             let cf_clearance = app.cf_clearance.clone();
@@ -230,7 +280,7 @@ pub fn handle_key(
     tx: mpsc::UnboundedSender<AppEvent>,
 ) -> bool {
     if matches!(app.view, AppView::FeedSelector) {
-        return handle_feed_selector_key(app, key);
+        return handle_feed_selector_key(app, key, tx);
     }
     if matches!(app.view, AppView::AuthorBrowser { .. }) {
         return handle_author_browser_key(app, key, tx);
@@ -280,6 +330,7 @@ pub fn handle_key(
             files,
             selected_idx,
             preview_content,
+            preview_lines,
             preview_scroll_y,
             active_pane,
             preview_height,
@@ -296,6 +347,7 @@ pub fn handle_key(
                         if !files.is_empty() && *selected_idx > 0 {
                             *selected_idx -= 1;
                             *preview_content = load_preview_content(&files[*selected_idx]);
+                            *preview_lines = render_markdown(preview_content);
                             *preview_scroll_y = 0;
                         }
                     }
@@ -308,6 +360,7 @@ pub fn handle_key(
                         if !files.is_empty() && *selected_idx + 1 < files.len() {
                             *selected_idx += 1;
                             *preview_content = load_preview_content(&files[*selected_idx]);
+                            *preview_lines = render_markdown(preview_content);
                             *preview_scroll_y = 0;
                         }
                     }
@@ -355,10 +408,12 @@ pub fn enter_picker_view(app: &mut App) {
     }
 
     let preview_content = load_preview_content(&files[0]);
+    let preview_lines = render_markdown(&preview_content);
     app.view = AppView::Picker {
         files,
         selected_idx: 0,
         preview_content,
+        preview_lines,
         preview_scroll_y: 0,
         active_pane: PickerPane::Files,
         preview_height: 0,
