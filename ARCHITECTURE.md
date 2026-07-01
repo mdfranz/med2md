@@ -8,7 +8,7 @@ This document details the high-level architecture, component breakdown, and data
 
 ## 1. Core Architecture Diagram
 
-The system is organized into decoupled layers: a **UI & State Layer** executing on the main thread, **Asynchronous Workers** communicating via message-passing channels, a **Parsing/Transformation Engine** that parses and cleans HTML DOM structures, and a **Network Layer** that interacts with Medium APIs and RSS feeds.
+The system is organized into decoupled layers: a **UI & State Layer** executing on the main thread, **Asynchronous Workers** communicating via message-passing channels, a **Parsing/Transformation Engine** that parses and cleans HTML DOM structures, a **Network Layer** that interacts with Medium APIs and RSS feeds, and a **Storage Engine** handling markdown outputs, media directories, and cached local assets.
 
 ```mermaid
 graph TD
@@ -25,6 +25,7 @@ graph TD
     subgraph Async ["Asynchronous Workers"]
         downloader["Downloader Task (tokio::spawn)"]
         rss_fetcher["RSS / Following Fetcher"]
+        enricher["Author Enrichment Task"]
     end
 
     subgraph Net ["Network Layer (reqwest)"]
@@ -37,11 +38,13 @@ graph TD
         html_cleaner["DOM Cleaner (scraper)"]
         converter["HTML to Markdown (html2md)"]
         md_cleaner["Markdown post-processor"]
+        md_preview["TUI Markdown Renderer (tui-markdown)"]
     end
 
     subgraph Disk ["Storage Engine (Filesystem)"]
         md_output["Markdown Files (.md)"]
         img_output["Local Images Directory (_images/)"]
+        cache_store["Cache Directory (.cache/)"]
     end
 
     crossterm -->|Triggers input| app
@@ -50,16 +53,24 @@ graph TD
 
     app -->|Spawns async downloads| downloader
     app -->|Spawns async fetch| rss_fetcher
+    app -->|Spawns background enrichment| enricher
 
     rss_fetcher -->|Fetch followed users & feed| medium_rss
     downloader -->|Fetch raw HTML| medium_html
     downloader -->|Fetch images sequentially| cdn_images
+    enricher -->|Fetch author latest updates| medium_rss
 
     medium_html -->|Raw HTML| html_cleaner
     html_cleaner -->|Cleaned DOM & Image list| converter
     converter -->|Converted Markdown| md_cleaner
     md_cleaner -->|Optimized Markdown| md_output
+    md_output -->|Markdown content| md_preview
+    md_preview -->|Formatted ratatui::text::Line| app
     downloader -->|Download images| img_output
+
+    rss_fetcher -->|Read/Write Cache| cache_store
+    enricher -->|Write Meta Cache| cache_store
+    app -->|Read Cache| cache_store
 ```
 
 ---
@@ -95,38 +106,34 @@ flowchart TD
 
 ## 3. Component Breakdown
 
-All source code is housed in [src/main.rs](src/main.rs). The logic is split into the following primary components:
+The codebase is modularized into discrete sub-modules under `src/` to separate TUI rendering, state control, network calls, HTML traversal, and disk persistence:
 
-### A. State Management & Runtime
-*   **[App](src/main.rs#L46)**: The central state container. It manages session cookies (`sid`, `uid`, `cf_clearance`), pasted download URLs, operational log entries, and feed items selected for retrieval.
-*   **[AppView](src/main.rs#L22)**: A state enum managing TUI layouts:
-    *   `Download`: The main view containing URL paste inputs and real-time execution logs.
-    *   `Picker`: A browser layout to list files in the output directory and preview their rendered Markdown layout.
-    *   `FeedSelector`: A check-list selector to browse and choose articles to download from active feeds.
-    *   `AuthorBrowser`: A list viewer allowing the user to select followed writers/publications.
-    *   `Loading`: Displays a blocking loading spinner with custom notifications.
-*   **[AppEvent](src/main.rs#L40)**: Message definitions used to communicate between background async workers and the foreground TUI loop.
+### A. State Management, UI & Event Handling
+*   **[src/main.rs](src/main.rs)**: The application entry point. Parses command line arguments, initializes tracing instrumentation, sets up cookie authentication, and runs the terminal event loop.
+*   **[src/app.rs](src/app.rs)**: Defines the central structures [App](src/app.rs#L60) (global application state), [AppView](src/app.rs#L30) (UI view variants: `Download`, `Picker`, `FeedSelector`, `AuthorBrowser`, `Loading`), and [AppEvent](src/app.rs#L51) (async channels communication event enumeration).
+*   **[src/ui.rs](src/ui.rs)**: Renders TUI frames and subcomponents in [draw_ui](src/ui.rs#L78) using Ratatui layout splits, block borders, lists, and formatted paragraphs.
+*   **[src/input.rs](src/input.rs)**: Listens for key events and triggers actions in [handle_key](src/input.rs#L277), cleans multi-line URL payloads via [handle_paste](src/input.rs#L128), and kicks off async download loops in [start_download](src/input.rs#L423).
 
-### B. User Interface & Event Processing
-*   **[draw_ui](src/main.rs#L1880)**: Directs the layout and rendering of TUI panels (using Ratatui layout splits, block borders, lists, and text paragraphs).
-*   **[handle_key](src/main.rs#L326)**: Dispatches keyboard events relative to the active `AppView` (e.g. text navigation, checkbox toggles, or view switching shortcuts like `Ctrl+P`).
-*   **[handle_paste](src/main.rs#L226)**: Processes raw system clipboard entries, filtering and splitting multi-line inputs into a series of downloadable URLs.
+### B. Network, Authentication & API Harvesting
+*   **[src/auth.rs](src/auth.rs)**: Implements [setup_cookies](src/auth.rs#L38) to read tokens from environment variables or query users interactively using `rpassword`, validating session integrity against Medium endpoints.
+*   **[src/following.rs](src/following.rs)**: Retrieves followed writers and publications lists in [fetch_following_list](src/following.rs#L426) and crawls creators' RSS feeds to compile feed checklist details in [fetch_following_feed](src/following.rs#L41).
+*   **[src/articles.rs](src/articles.rs)**: Queries user-specific author articles utilizing Medium API pagination limits and fallback RSS scraping.
+*   **[src/feed.rs](src/feed.rs)**: Strips XSSI security wrappers from JSON responses, parses Apollo GraphQL states, and parses XML RSS feeds.
+*   **[src/net.rs](src/net.rs)**: Defines common reqwest headers and manages sequential article downloading in [perform_download](src/net.rs#L33).
 
-### C. Network & Authentication
-*   **[setup_cookies](src/main.rs#L2204)**: Reads credentials from environment variables (`MEDIUM_SID`, `MEDIUM_UID`, `MEDIUM_CF_CLEARANCE`) or prompts the user interactively (using `rpassword`) before executing the TUI. It makes a test HTTP handshake against Medium to verify validation.
-*   **[fetch_following_list](src/main.rs#L1530)**: Resolves followed accounts by hitting internal API endpoints or parsing Medium following pages.
-*   **[fetch_following_feed](src/main.rs#L1151)**: Obtains article suggestions by fetching feed endpoints, parsing their embedded Apollo GraphQL states, and crawling the RSS feeds of followed creators.
-
-### D. Downloader & Cleaner Engine
-*   **[start_download](src/main.rs#L594)**: Spawns the background runtime task that iterates through download targets, updates logs, and signals when downloads conclude.
-*   **[perform_download](src/main.rs#L1699)**: orchestrates downloading an individual article's HTML, parsing the DOM, extracting assets, saving Markdown content, and fetching the image payloads.
-*   **[clean_article_and_collect_images](src/main.rs#L902)**: Parses `<picture>` components to capture full-size CDN links, detaches deprecated child elements, assigns relative local paths (`./[slug]_images/img_x.ext`), and rewrites matching DOM `src` attributes.
-*   **[clean_article](src/main.rs#L707)**: Traverses the parsed HTML DOM to prune scripts, layout buttons, tracking query parameters, navigation footers, and Medium membership banners.
+### C. Processing, Formatting & Storage
+*   **[src/html.rs](src/html.rs)**: Houses the parsing and DOM cleaning routines including [clean_article](src/html.rs#L70) (element extraction, detach nodes) and [clean_article_and_collect_images](src/html.rs#L253) (srcset extraction, relative target path rewriting).
+*   **[src/markdown.rs](src/markdown.rs)**: Formats local markdown files for the preview pane using `tui-markdown` in [render_markdown](src/markdown.rs#L8).
+*   **[src/cache.rs](src/cache.rs)**: Reads and writes JSON-serialized records of authors, RSS feed items, and author metadata to the local cache directory under `<output_dir>/.cache`.
+*   **[src/meta.rs](src/meta.rs)**: Coordinates asynchronous background author enrichment via [enrich_authors](src/meta.rs#L83) to fetch the latest post timestamps and post counts for all creators.
+*   **[src/util.rs](src/util.rs)**: Implements common date formatting, slug sanitization, and jitter wait calculation.
 
 ---
 
 ## 4. Key Architectural Choices
 
-1.  **Asynchronous Background Concurrency**: Heavy-weight IO operations (such as scraping, RSS fetching, and HTTP downloading) are offloaded to tokio threads via `tokio::spawn`. This prevents blockages in TUI rendering or user key processing.
+1.  **Asynchronous Background Concurrency**: Heavy-weight IO operations (such as scraping, RSS fetching, author enrichment, and HTTP downloading) are offloaded to tokio threads via `tokio::spawn`. This prevents blockages in TUI rendering or user key processing.
 2.  **Sequential Downloads with Jitter**: To protect the user's IP address and session from security challenges and rate-limiting from Cloudflare/Medium, downloads are executed sequentially rather than in parallel, separated by jittered delay periods.
 3.  **Apollo GraphQL Harvesting**: Instead of relying purely on unstable HTML scraping structures, `med2md` parses the JSON Apollo State initialized within script tags in Medium's homepage, enabling stable retrieval of followed author details.
+4.  **Author Enrichment and Cache Synchronization**: The background enrichment worker (defined in [src/meta.rs](src/meta.rs)) queries each author's latest post RSS timestamp and total posts. It caches them locally (`.cache/`) to avoid heavy startup fetches, enabling instantaneous reloading.
+5.  **Formatted Markdown Rendering**: Swapped raw text viewing in the file picker preview pane for a fully formatted rendered layout using `tui-markdown` to provide a premium viewing experience directly within the terminal interface.
