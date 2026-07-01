@@ -68,6 +68,13 @@ The project has evolved through several key phases recorded in its git history:
     *   **tui-markdown Integration**: Swapped raw text viewing of markdown files in the preview pane for a fully formatted rendered layout utilizing the `tui-markdown` crate.
     *   **Crate Upgrades**: Upgraded `ratatui` to `0.30` and `crossterm` to `0.28` to maintain compatibility with modern terminal standards.
 
+### Phase 6: Caching, Author Enrichment, and Architecture Updates
+*   **Git Commits**: `4c2f080` (Add PROJECT.md), `9dc462a` (Add cache, author enrichment, download pipeline), `a8d8a0a` (Update system architecture and package dependencies docs)
+*   **Key Features**:
+    *   **Local Cache Store**: Introduced a JSON-serialized local cache under `<output_dir>/.cache` for followed creators, feed details, and publication metadata using `serde_json` to reduce redundant network hits on startup.
+    *   **Background Author Enrichment**: Implemented an async background enrichment pipeline (`src/meta.rs`) that queries creators' RSS feeds sequentially with jitter and exponential backoff to populate post counts and last-active timestamps.
+    *   **Documentation Refactoring**: Created `PROJECT.md` to trace feature evolution, and updated `ARCHITECTURE.md` and `PKG.md` to align with the modularized sub-modules structure and upgraded dependency packages.
+
 ---
 
 ## 2. Current Codebase Structure
@@ -86,7 +93,7 @@ The modern modularized files in `src/` serve distinct roles in the application l
 | [src/html.rs](src/html.rs) | Implements the DOM cleanup pipeline. Traverses elements to prune scripts, tracking parameters, banners, and map CDN image sources to local targets. |
 | [src/input.rs](src/input.rs) | Processes keypress mappings and clipboard copy-paste hooks depending on the current active `AppView`. |
 | [src/markdown.rs](src/markdown.rs) | Reads downloaded documents and converts them to formatted Ratatui lines using `tui-markdown`. |
-| [src/meta.rs](src/meta.rs) | Stores downloaded article metadata structures. |
+| [src/meta.rs](src/meta.rs) | Coordinates asynchronous background author enrichment to fetch the latest post timestamps and post counts for all creators. |
 | [src/net.rs](src/net.rs) | Assembles user-agents and browser-like cookie headers to bypass basic automated scrape blocks. |
 | [src/ui.rs](src/ui.rs) | Translates the application view states into layout block definitions, displaying the URL inputs, logs, checklists, and formatted files. |
 | [src/util.rs](src/util.rs) | Helper functions for generating delay jitter, parsing filesystem file types, formatting time signatures, and sanitizing article URLs into file slugs. |
