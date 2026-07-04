@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use crate::browser::{BrowserLink, BrowserCommand};
 
 pub enum PickerPane {
     Files,
@@ -46,6 +47,12 @@ pub enum AppView {
         scroll: usize,
     },
     Loading { message: String },
+    Browser {
+        current_url: String,
+        links: Vec<BrowserLink>,
+        selected_idx: usize,
+        scroll_offset: usize,
+    },
 }
 
 pub enum AppEvent {
@@ -55,6 +62,10 @@ pub enum AppEvent {
     AuthorEnriched(String, i64, usize),
     EnrichmentThrottled(u64),
     EnrichmentDone,
+    BrowserReady {
+        url: String,
+        links: Vec<BrowserLink>,
+    },
 }
 
 pub struct App {
@@ -80,6 +91,7 @@ pub struct App {
     pub author_sort: AuthorSort,
     pub enrichment_throttle: Option<u64>,
     pub use_chromium: bool,
+    pub browser_tx: Option<tokio::sync::mpsc::UnboundedSender<BrowserCommand>>,
 }
 
 impl App {
@@ -100,6 +112,7 @@ impl App {
             force_download: false,
             urls_scroll_y: 0,
             use_chromium: false,
+            browser_tx: None,
 
             view: AppView::Download,
             feed_articles: Vec::<(String, String, String, String)>::new(),

@@ -285,10 +285,18 @@ pub fn handle_key(
     if matches!(app.view, AppView::AuthorBrowser { .. }) {
         return handle_author_browser_key(app, key, tx);
     }
+    if matches!(app.view, AppView::Browser { .. }) {
+        return handle_browser_key(app, key, tx);
+    }
     if matches!(app.view, AppView::Loading { .. }) {
         if key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) {
             return true;
         }
+        return false;
+    }
+
+    if key.code == KeyCode::Char('w') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        enter_browser_mode(app, tx.clone());
         return false;
     }
 
@@ -304,7 +312,7 @@ pub fn handle_key(
             AppView::Picker { .. } => {
                 app.view = AppView::Download;
             }
-            AppView::FeedSelector | AppView::AuthorBrowser { .. } | AppView::Loading { .. } => {}
+            AppView::FeedSelector | AppView::AuthorBrowser { .. } | AppView::Loading { .. } | AppView::Browser { .. } => {}
         }
         return false;
     }
@@ -379,7 +387,7 @@ pub fn handle_key(
                 _ => {}
             }
         }
-        AppView::FeedSelector | AppView::AuthorBrowser { .. } | AppView::Loading { .. } => {}
+        AppView::FeedSelector | AppView::AuthorBrowser { .. } | AppView::Loading { .. } | AppView::Browser { .. } => {}
     }
     false
 }
@@ -486,4 +494,130 @@ pub fn start_download(app: &mut App, tx: mpsc::UnboundedSender<AppEvent>) {
         let _ = tx.send(AppEvent::Log("All tasks completed.".to_string()));
         let _ = tx.send(AppEvent::DownloadFinished);
     });
+}
+
+pub fn enter_browser_mode(app: &mut App, tx: mpsc::UnboundedSender<AppEvent>) {
+    if app.browser_tx.is_some() {
+        app.view = AppView::Browser {
+            current_url: "https://medium.com".to_string(),
+            links: Vec::new(),
+            selected_idx: 0,
+            scroll_offset: 0,
+        };
+        let _ = app.browser_tx.as_ref().unwrap().send(crate::browser::BrowserCommand::Navigate("https://medium.com".to_string()));
+        return;
+    }
+
+    app.view = AppView::Loading { message: "Launching headless Chromium...".to_string() };
+    let (browser_tx, browser_rx) = mpsc::unbounded_channel::<crate::browser::BrowserCommand>();
+    app.browser_tx = Some(browser_tx);
+
+    let sid = app.sid.clone();
+    let uid = app.uid.clone();
+    let cf = app.cf_clearance.clone();
+    let initial_url = "https://medium.com".to_string();
+
+    tokio::spawn(async move {
+        crate::browser::run_browser_task(sid, uid, cf, initial_url, tx, browser_rx).await;
+    });
+}
+
+pub fn handle_browser_key(
+    app: &mut App,
+    key: KeyEvent,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) -> bool {
+    if key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) {
+        app.view = AppView::Download;
+        return false;
+    }
+
+    enum BrowserAction {
+        None,
+        GoBack,
+        ScrollDown,
+        Navigate(String),
+        DownloadArticle(String, String),
+    }
+
+    let mut action = BrowserAction::None;
+
+    if let AppView::Browser {
+        current_url: _,
+        links,
+        selected_idx,
+        scroll_offset,
+    } = &mut app.view
+    {
+        match key.code {
+            KeyCode::Up => {
+                if *selected_idx > 0 {
+                    *selected_idx -= 1;
+                    if *selected_idx < *scroll_offset {
+                        *scroll_offset = *selected_idx;
+                    }
+                }
+            }
+            KeyCode::Down => {
+                if !links.is_empty() && *selected_idx < links.len() - 1 {
+                    *selected_idx += 1;
+                    if *selected_idx >= *scroll_offset + 20 {
+                        *scroll_offset = *selected_idx - 19;
+                    }
+                }
+            }
+            KeyCode::Char('b') | KeyCode::Backspace => {
+                action = BrowserAction::GoBack;
+            }
+            KeyCode::PageDown | KeyCode::Char(' ') => {
+                action = BrowserAction::ScrollDown;
+            }
+            KeyCode::Enter => {
+                if !links.is_empty() {
+                    let link = &links[*selected_idx];
+                    match link.kind {
+                        crate::browser::LinkKind::Article => {
+                            action = BrowserAction::DownloadArticle(link.url.clone(), link.text.clone());
+                        }
+                        _ => {
+                            action = BrowserAction::Navigate(link.url.clone());
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('d') => {
+                if !links.is_empty() {
+                    let link = &links[*selected_idx];
+                    action = BrowserAction::DownloadArticle(link.url.clone(), link.text.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    match action {
+        BrowserAction::None => {}
+        BrowserAction::GoBack => {
+            if let Some(btx) = &app.browser_tx {
+                let _ = btx.send(crate::browser::BrowserCommand::GoBack);
+            }
+        }
+        BrowserAction::ScrollDown => {
+            if let Some(btx) = &app.browser_tx {
+                let _ = btx.send(crate::browser::BrowserCommand::ScrollDown);
+            }
+        }
+        BrowserAction::Navigate(url) => {
+            if let Some(btx) = &app.browser_tx {
+                let _ = btx.send(crate::browser::BrowserCommand::Navigate(url));
+            }
+        }
+        BrowserAction::DownloadArticle(url, text) => {
+            app.urls = vec![url];
+            app.log(format!("Selected article from browser: {}", text));
+            start_download(app, tx);
+        }
+    }
+
+    false
 }

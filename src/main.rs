@@ -16,6 +16,7 @@ mod input;
 use input::{handle_key, handle_paste, enter_picker_view};
 mod ui;
 use ui::draw_ui;
+mod browser;
 
 use std::io;
 use std::time::Duration;
@@ -43,6 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  med2md --force            Re-download articles even if they already exist");
         println!("  med2md --refresh          Ignore cache and re-fetch authors/feed from Medium");
         println!("  med2md --chromium         Use headless Chromium browser to scrape HTML");
+        println!("  med2md --web              Launch TUI web browser to browse and select articles");
         println!("  med2md --log <path>       Write JSON logs to <path> (default: medium.log)\n");
         println!("ENVIRONMENT VARIABLES:");
         println!("  MEDIUM_SID          Your Medium session cookie (required for member-only content)");
@@ -80,10 +82,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let browse_mode = args.iter().any(|a| a == "--browse");
     let refresh = args.iter().any(|a| a == "--refresh");
     let chromium_mode = args.iter().any(|a| a == "--chromium");
+    let web_mode = args.iter().any(|a| a == "--web");
 
     let (sid, uid, cf_clearance) = setup_cookies().await;
 
-    if feed_mode || authors_mode || (!browse_mode && args.len() == 1) {
+    if feed_mode || authors_mode || (!browse_mode && !web_mode && args.len() == 1) {
         if let Err(e) = check_session(&sid, &uid, &cf_clearance).await {
             if chromium_mode {
                 eprintln!("Warning: HTTP session validation failed: {}. Continuing anyway because --chromium is enabled.", e);
@@ -166,11 +169,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut app = App::new(sid, uid, cf_clearance, output_dir);
     app.force_download = force_download;
-    app.use_chromium = chromium_mode;
+    app.use_chromium = chromium_mode || web_mode;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
 
-    if authors_mode && !initial_authors.is_empty() {
+    if web_mode {
+        input::enter_browser_mode(&mut app, tx.clone());
+    } else if authors_mode && !initial_authors.is_empty() {
         // Always load meta cache for immediate display, even if stale
         if let Some(meta) = cache::read_meta_cache(&cache_dir, u64::MAX) {
             app.author_meta = meta;
@@ -245,6 +250,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         app.view = AppView::FeedSelector;
                     }
+                }
+                AppEvent::BrowserReady { url, links } => {
+                    app.view = AppView::Browser {
+                        current_url: url,
+                        links,
+                        selected_idx: 0,
+                        scroll_offset: 0,
+                    };
                 }
             }
         }

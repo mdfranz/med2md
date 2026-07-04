@@ -288,6 +288,86 @@ pub fn draw_ui(f: &mut Frame, app: &mut App) {
         return;
     }
 
+    if let AppView::Browser {
+        current_url,
+        links,
+        selected_idx,
+        scroll_offset,
+    } = &app.view
+    {
+        let list_block = Block::default()
+            .title(format!(" Headless TUI Browser — {} links found ", links.len()))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Yellow));
+
+        let inner = list_block.inner(chunks[1]);
+        let height = inner.height as usize;
+
+        let start = *scroll_offset;
+        let end = (start + height).min(links.len());
+
+        let items: Vec<ListItem> = links[start..end].iter().enumerate()
+            .map(|(rel, link)| {
+                let abs = start + rel;
+                let is_selected = abs == *selected_idx;
+
+                let (kind_str, kind_color) = match link.kind {
+                    crate::browser::LinkKind::Article => (" [Art] ", Color::Green),
+                    crate::browser::LinkKind::Author => (" [@Usr] ", Color::Cyan),
+                    crate::browser::LinkKind::Feed => (" [Feed] ", Color::Magenta),
+                    crate::browser::LinkKind::Other => (" [Link] ", Color::White),
+                };
+
+                let style = if is_selected {
+                    Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+
+                let mut spans = vec![
+                    Span::styled(kind_str, Style::default().fg(kind_color).add_modifier(Modifier::BOLD)),
+                    Span::styled(link.text.clone(), style),
+                ];
+                if !is_selected {
+                    spans.push(Span::styled(format!(" ({})", link.url), Style::default().fg(Color::DarkGray)));
+                }
+
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+
+        let list = List::new(items).block(list_block);
+
+        let browser_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(1),
+            ])
+            .split(chunks[1]);
+
+        let url_p = Paragraph::new(Line::from(vec![
+            Span::styled(" URL: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(current_url.clone(), Style::default().fg(Color::Yellow).add_modifier(Modifier::UNDERLINED)),
+        ]));
+        f.render_widget(url_p, browser_chunks[0]);
+        f.render_widget(list, browser_chunks[1]);
+
+        let footer_text = "  [↑↓] Select  [Enter] Follow/Download  [D] Force Download  [Backsp/B] Back  [Space/PgDn] Scroll Down  [Esc] Exit  [Ctrl+C] Quit";
+        let footer_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::DarkGray));
+        let footer_p = Paragraph::new(Line::from(Span::styled(
+            footer_text,
+            Style::default().fg(Color::Black).bg(Color::Yellow),
+        )))
+        .block(footer_block);
+        f.render_widget(footer_p, chunks[2]);
+        return;
+    }
+
     match &mut app.view {
         AppView::Download => {
             let main_chunks = Layout::default()
@@ -425,5 +505,6 @@ pub fn draw_ui(f: &mut Frame, app: &mut App) {
         AppView::FeedSelector => unreachable!(),
         AppView::AuthorBrowser { .. } => unreachable!(),
         AppView::Loading { .. } => unreachable!(),
+        AppView::Browser { .. } => unreachable!(),
     }
 }
