@@ -499,23 +499,23 @@ pub fn start_download(app: &mut App, tx: mpsc::UnboundedSender<AppEvent>) {
 pub fn enter_browser_mode(app: &mut App, tx: mpsc::UnboundedSender<AppEvent>) {
     if app.browser_tx.is_some() {
         app.view = AppView::Browser {
-            current_url: "https://medium.com".to_string(),
+            current_url: "https://medium.com/me/feed".to_string(),
             links: Vec::new(),
             selected_idx: 0,
             scroll_offset: 0,
         };
-        let _ = app.browser_tx.as_ref().unwrap().send(crate::browser::BrowserCommand::Navigate("https://medium.com".to_string()));
+        let _ = app.browser_tx.as_ref().unwrap().send(crate::browser::BrowserCommand::Navigate("https://medium.com/me/feed".to_string()));
         return;
     }
 
-    app.view = AppView::Loading { message: "Launching headless Chromium...".to_string() };
+    app.view = AppView::Loading { message: "Launching TUI Browser...".to_string() };
     let (browser_tx, browser_rx) = mpsc::unbounded_channel::<crate::browser::BrowserCommand>();
     app.browser_tx = Some(browser_tx);
 
     let sid = app.sid.clone();
     let uid = app.uid.clone();
     let cf = app.cf_clearance.clone();
-    let initial_url = "https://medium.com".to_string();
+    let initial_url = "https://medium.com/me/feed".to_string();
 
     tokio::spawn(async move {
         crate::browser::run_browser_task(sid, uid, cf, initial_url, tx, browser_rx).await;

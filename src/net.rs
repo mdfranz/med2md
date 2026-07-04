@@ -159,11 +159,17 @@ pub async fn fetch_html_chromium(
     uid: &str,
     cf_clearance: &str,
 ) -> Result<String, String> {
+    let user_agent = std::env::var("MEDIUM_USER_AGENT")
+        .unwrap_or_else(|_| "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36".to_string());
+
     let config = BrowserConfig::builder()
         .chrome_executable("/usr/bin/chromium")
         .arg("--headless")
         .arg("--no-sandbox")
         .arg("--disable-gpu")
+        .arg("--disable-blink-features=AutomationControlled")
+        .arg("--host-resolver-rules=MAP challenges.cloudflare.com ~NOTFOUND")
+        .arg(format!("--user-agent={}", user_agent))
         .build()
         .map_err(|e| format!("Failed to build browser config: {}", e))?;
 
@@ -184,12 +190,40 @@ pub async fn fetch_html_chromium(
         .await
         .map_err(|e| format!("Failed to create new page: {}", e))?;
 
-    // Navigate to medium.com domain first, so we can set cookies for it
-    if let Err(e) = page.goto("https://medium.com").await {
-        tracing::warn!("Initial navigation to medium.com failed (this is expected if unauthenticated): {}", e);
+    let stealth_js = r#"
+        try {
+            delete Object.getPrototypeOf(navigator).webdriver;
+        } catch (e) {}
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+        window.chrome = { runtime: {} };
+        try {
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) => (
+                parameters.name === 'notifications' ?
+                    Promise.resolve({ state: Notification.permission }) :
+                    originalQuery(parameters)
+            );
+        } catch (e) {}
+        try {
+            const getParameter = WebGLRenderingContext.prototype.getParameter;
+            WebGLRenderingContext.prototype.getParameter = function(parameter) {
+                if (parameter === 37445) return 'Google Inc. (Intel)';
+                if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+                return getParameter(parameter);
+            };
+        } catch (e) {}
+    "#;
+
+    if let Err(e) = page.evaluate_on_new_document(stealth_js).await {
+        tracing::warn!("Failed to inject stealth script: {}", e);
     }
 
-    // Set the provided cookies
+    if let Err(e) = page.goto("https://medium.com/robots.txt").await {
+        tracing::warn!("Initial navigation to medium.com/robots.txt failed (expected if not logged in yet): {}", e);
+    }
+
+    tracing::info!("Setting cookies in Chromium...");
     if !sid.is_empty() {
         let cookie = CookieParam::builder()
             .name("sid")
@@ -230,10 +264,25 @@ pub async fn fetch_html_chromium(
             .map_err(|e| format!("Failed to set cf_clearance cookie: {}", e))?;
     }
 
+    match page.get_cookies().await {
+        Ok(c) => {
+            let names: Vec<String> = c.iter().map(|cookie| format!("{} (domain={})", cookie.name, cookie.domain)).collect();
+            tracing::info!("Cookies currently in Chromium: {:?}", names);
+        }
+        Err(e) => {
+            tracing::warn!("Failed to retrieve cookies in Chromium: {}", e);
+        }
+    }
+
     // Navigate to the target page URL
+    tracing::info!("Navigating to article URL: {}", url_str);
     page.goto(url_str)
         .await
         .map_err(|e| format!("Failed to navigate to target URL: {}", e))?;
+
+    if let Ok(Some(title)) = page.get_title().await {
+        tracing::info!("Loaded page title: {}", title);
+    }
 
     // Wait for the page content to load. Since Medium dynamically renders content,
     // we wait for the <article> element. We'll poll for it up to 5 seconds.

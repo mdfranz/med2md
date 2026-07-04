@@ -169,7 +169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut app = App::new(sid, uid, cf_clearance, output_dir);
     app.force_download = force_download;
-    app.use_chromium = chromium_mode || web_mode;
+    app.use_chromium = chromium_mode;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
 

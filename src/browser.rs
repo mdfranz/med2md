@@ -1,7 +1,5 @@
 use tokio::sync::mpsc;
-use chromiumoxide::{Browser, BrowserConfig};
-use chromiumoxide::cdp::browser_protocol::network::CookieParam;
-use futures::StreamExt;
+use reqwest::header::{HeaderValue, ACCEPT};
 use crate::app::AppEvent;
 
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -33,139 +31,73 @@ pub async fn run_browser_task(
     tx: mpsc::UnboundedSender<AppEvent>,
     mut rx: mpsc::UnboundedReceiver<BrowserCommand>,
 ) {
-    let config = match BrowserConfig::builder()
-        .chrome_executable("/usr/bin/chromium")
-        .arg("--headless")
-        .arg("--no-sandbox")
-        .arg("--disable-gpu")
-        .build()
-    {
-        Ok(cfg) => cfg,
+    let mut headers = crate::net::build_cookie_headers(&sid, &uid, &cf_clearance);
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8"),
+    );
+
+    let client = match reqwest::Client::builder().default_headers(headers).build() {
+        Ok(c) => c,
         Err(e) => {
-            let _ = tx.send(AppEvent::Log(format!("Error: Failed to build browser config: {}", e)));
+            let _ = tx.send(AppEvent::Log(format!("Error: Failed to build HTTP client: {}", e)));
             return;
         }
     };
-
-    let (mut browser, mut handler) = match Browser::launch(config).await {
-        Ok(res) => res,
-        Err(e) => {
-            let _ = tx.send(AppEvent::Log(format!("Error: Failed to launch Chromium: {}", e)));
-            return;
-        }
-    };
-
-    let _handler_handle = tokio::spawn(async move {
-        while let Some(h) = handler.next().await {
-            if h.is_err() {
-                break;
-            }
-        }
-    });
-
-    let page = match browser.new_page("about:blank").await {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = tx.send(AppEvent::Log(format!("Error: Failed to create page: {}", e)));
-            let _ = browser.close().await;
-            return;
-        }
-    };
-
-    if let Err(e) = page.goto("https://medium.com").await {
-        tracing::warn!("Browser task initial goto failed: {}", e);
-    }
-
-    let mut cookies = Vec::new();
-    if !sid.is_empty() {
-        cookies.push(("sid", sid));
-    }
-    if !uid.is_empty() {
-        cookies.push(("uid", uid));
-    }
-    if !cf_clearance.is_empty() {
-        cookies.push(("cf_clearance", cf_clearance));
-    }
-
-    for (name, val) in cookies {
-        if let Ok(cookie) = CookieParam::builder()
-            .name(name)
-            .value(val)
-            .domain(".medium.com")
-            .path("/")
-            .secure(true)
-            .build()
-        {
-            let _ = page.set_cookie(cookie).await;
-        }
-    }
 
     let mut history: Vec<String> = Vec::new();
     let mut current_url = initial_url.clone();
 
-    let _ = tx.send(AppEvent::Log(format!("Browser navigating to {}...", current_url)));
-    if let Err(e) = page.goto(&current_url).await {
-        let _ = tx.send(AppEvent::Log(format!("Navigation error: {}", e)));
-    } else {
-        tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
-        match extract_links(&page).await {
-            Ok(links) => {
-                let _ = tx.send(AppEvent::BrowserReady { url: current_url.clone(), links });
-            }
-            Err(e) => {
-                let _ = tx.send(AppEvent::Log(format!("Failed to extract links: {}", e)));
-            }
+    if current_url == "https://medium.com" || current_url == "https://medium.com/" {
+        current_url = "https://medium.com/me/feed".to_string();
+    }
+
+    let _ = tx.send(AppEvent::Log(format!("Loading {}...", current_url)));
+    match fetch_and_parse(&client, &current_url).await {
+        Ok(links) => {
+            let _ = tx.send(AppEvent::BrowserReady { url: current_url.clone(), links });
+        }
+        Err(e) => {
+            let _ = tx.send(AppEvent::Log(format!("Failed to load page: {}", e)));
         }
     }
 
     while let Some(cmd) = rx.recv().await {
         match cmd {
             BrowserCommand::Navigate(url) => {
-                let _ = tx.send(AppEvent::Log(format!("Navigating to {}...", url)));
-                history.push(current_url.clone());
-                current_url = url.clone();
-                if let Err(e) = page.goto(&current_url).await {
-                    let _ = tx.send(AppEvent::Log(format!("Navigation error: {}", e)));
-                } else {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
-                    match extract_links(&page).await {
-                        Ok(links) => {
-                            let _ = tx.send(AppEvent::BrowserReady { url: current_url.clone(), links });
-                        }
-                        Err(e) => {
-                            let _ = tx.send(AppEvent::Log(format!("Failed to extract links: {}", e)));
-                        }
-                    }
+                let mut target_url = url.clone();
+                if target_url == "https://medium.com"
+                    || target_url == "https://medium.com/"
+                    || (target_url.starts_with("https://medium.com/?") && target_url.contains("source=home"))
+                    || (target_url.starts_with("https://medium.com?") && target_url.contains("source=home"))
+                {
+                    target_url = "https://medium.com/me/feed".to_string();
                 }
-            }
-            BrowserCommand::ScrollDown => {
-                let _ = tx.send(AppEvent::Log("Scrolling down to load more...".to_string()));
-                let _ = page.evaluate("window.scrollBy(0, window.innerHeight);").await;
-                tokio::time::sleep(tokio::time::Duration::from_millis(1200)).await;
-                match extract_links(&page).await {
+                let _ = tx.send(AppEvent::Log(format!("Loading {}...", target_url)));
+                history.push(current_url.clone());
+                current_url = target_url;
+                match fetch_and_parse(&client, &current_url).await {
                     Ok(links) => {
                         let _ = tx.send(AppEvent::BrowserReady { url: current_url.clone(), links });
                     }
                     Err(e) => {
-                        let _ = tx.send(AppEvent::Log(format!("Failed to extract links: {}", e)));
+                        let _ = tx.send(AppEvent::Log(format!("Failed to load page: {}", e)));
                     }
                 }
             }
+            BrowserCommand::ScrollDown => {
+                let _ = tx.send(AppEvent::Log("Scroll down is not supported in static mode".to_string()));
+            }
             BrowserCommand::GoBack => {
                 if let Some(prev_url) = history.pop() {
-                    let _ = tx.send(AppEvent::Log(format!("Going back to {}...", prev_url)));
+                    let _ = tx.send(AppEvent::Log(format!("Loading {}...", prev_url)));
                     current_url = prev_url.clone();
-                    if let Err(e) = page.goto(&current_url).await {
-                        let _ = tx.send(AppEvent::Log(format!("Navigation error: {}", e)));
-                    } else {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
-                        match extract_links(&page).await {
-                            Ok(links) => {
-                                let _ = tx.send(AppEvent::BrowserReady { url: current_url.clone(), links });
-                            }
-                            Err(e) => {
-                                let _ = tx.send(AppEvent::Log(format!("Failed to extract links: {}", e)));
-                            }
+                    match fetch_and_parse(&client, &current_url).await {
+                        Ok(links) => {
+                            let _ = tx.send(AppEvent::BrowserReady { url: current_url.clone(), links });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AppEvent::Log(format!("Failed to load page: {}", e)));
                         }
                     }
                 } else {
@@ -174,62 +106,105 @@ pub async fn run_browser_task(
             }
         }
     }
-
-    let _ = browser.close().await;
 }
 
-#[derive(serde::Deserialize, Debug)]
-struct RawLink {
-    text: String,
-    href: String,
-}
-
-async fn extract_links(page: &chromiumoxide::Page) -> Result<Vec<BrowserLink>, String> {
-    let eval_res = page.evaluate(r#"
-        () => {
-            return Array.from(document.querySelectorAll('a')).map(a => {
-                return {
-                    text: a.innerText.trim(),
-                    href: a.href
-                };
-            });
-        }
-    "#).await.map_err(|e| format!("JS evaluation error: {}", e))?;
-
-    let raw_links: Vec<RawLink> = eval_res.into_value().map_err(|e| format!("Failed to deserialize links: {}", e))?;
+async fn fetch_and_parse(client: &reqwest::Client, url: &str) -> Result<Vec<BrowserLink>, String> {
+    let res = client.get(url).send().await.map_err(|e| format!("Request failed: {}", e))?;
+    if !res.status().is_success() {
+        return Err(format!("HTTP status error: {}", res.status()));
+    }
+    let html = res.text().await.map_err(|e| format!("Failed to read response body: {}", e))?;
 
     let mut links = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
+    // 1. Extract feed articles and following data from window.__APOLLO_STATE__ (which contains client-side rendered feed content)
+    let (usernames, pub_slugs, posts) = crate::feed::extract_following_from_html(&html);
+    for (_ts, title, post_url, author) in posts {
+        let mut full_url = post_url.trim().to_string();
+        if !full_url.starts_with("http") {
+            if full_url.starts_with('/') {
+                full_url = format!("https://medium.com{}", full_url);
+            } else {
+                full_url = format!("https://medium.com/{}", full_url);
+            }
+        }
+        if seen.insert(full_url.clone()) {
+            let display_text = if author.is_empty() {
+                title
+            } else {
+                format!("{} (by {})", title, author)
+            };
+            links.push(BrowserLink {
+                text: display_text,
+                url: full_url,
+                kind: LinkKind::Article,
+            });
+        }
+    }
+
+    // 2. Extract followed authors and publications directory from window.__APOLLO_STATE__
+    for username in usernames {
+        let author_url = format!("https://medium.com/@{}", username);
+        if seen.insert(author_url.clone()) {
+            links.push(BrowserLink {
+                text: format!("Author: @{}", username),
+                url: author_url,
+                kind: LinkKind::Author,
+            });
+        }
+    }
+    for slug in pub_slugs {
+        let pub_url = format!("https://medium.com/{}", slug);
+        if seen.insert(pub_url.clone()) {
+            links.push(BrowserLink {
+                text: format!("Publication: {}", slug),
+                url: pub_url,
+                kind: LinkKind::Author,
+            });
+        }
+    }
+
+    // 3. Parse regular <a> tags in the HTML body (for sidebars, headers, footer links)
+    let document = scraper::Html::parse_document(&html);
+    let a_selector = scraper::Selector::parse("a").map_err(|e| format!("Failed to parse selector: {:?}", e))?;
     let slug_pattern = regex::Regex::new(r"-[a-f0-9]{10,12}$").unwrap();
 
-    for raw in raw_links {
-        let url = raw.href.trim().to_string();
-        let text = raw.text.replace("\n", " ").trim().to_string();
-
-        if url.is_empty() || !url.starts_with("http") || text.is_empty() {
+    for element in document.select(&a_selector) {
+        let href = element.value().attr("href").unwrap_or_default().trim().to_string();
+        if href.is_empty() {
             continue;
         }
 
-        if !seen.insert(url.clone()) {
+        let mut full_url = href.clone();
+        if href.starts_with('/') {
+            full_url = format!("https://medium.com{}", href);
+        }
+
+        let text = element.text().collect::<Vec<_>>().join(" ").trim().to_string();
+        if text.is_empty() || !full_url.starts_with("http") {
             continue;
         }
 
-        let kind = if url.contains("feed=following") || url.contains("/me/feed") {
+        if !seen.insert(full_url.clone()) {
+            continue;
+        }
+
+        let kind = if full_url.contains("feed=following") || full_url.contains("/me/feed") {
             LinkKind::Feed
-        } else if url.contains("medium.com/@") || url.contains("/@") {
-            if slug_pattern.is_match(&url) {
+        } else if full_url.contains("medium.com/@") || full_url.contains("/@") {
+            if slug_pattern.is_match(&full_url) {
                 LinkKind::Article
             } else {
                 LinkKind::Author
             }
-        } else if slug_pattern.is_match(&url) {
+        } else if slug_pattern.is_match(&full_url) {
             LinkKind::Article
         } else {
             LinkKind::Other
         };
 
-        links.push(BrowserLink { text, url, kind });
+        links.push(BrowserLink { text, url: full_url, kind });
     }
 
     Ok(links)
