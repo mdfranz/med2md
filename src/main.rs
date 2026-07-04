@@ -42,6 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  med2md --browse           Browse already-downloaded markdown files");
         println!("  med2md --force            Re-download articles even if they already exist");
         println!("  med2md --refresh          Ignore cache and re-fetch authors/feed from Medium");
+        println!("  med2md --chromium         Use headless Chromium browser to scrape HTML");
         println!("  med2md --log <path>       Write JSON logs to <path> (default: medium.log)\n");
         println!("ENVIRONMENT VARIABLES:");
         println!("  MEDIUM_SID          Your Medium session cookie (required for member-only content)");
@@ -78,13 +79,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let authors_mode = args.iter().any(|a| a == "--authors");
     let browse_mode = args.iter().any(|a| a == "--browse");
     let refresh = args.iter().any(|a| a == "--refresh");
+    let chromium_mode = args.iter().any(|a| a == "--chromium");
 
     let (sid, uid, cf_clearance) = setup_cookies().await;
 
     if feed_mode || authors_mode || (!browse_mode && args.len() == 1) {
         if let Err(e) = check_session(&sid, &uid, &cf_clearance).await {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
+            if chromium_mode {
+                eprintln!("Warning: HTTP session validation failed: {}. Continuing anyway because --chromium is enabled.", e);
+            } else {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
         }
     }
 
@@ -160,6 +166,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut app = App::new(sid, uid, cf_clearance, output_dir);
     app.force_download = force_download;
+    app.use_chromium = chromium_mode;
+
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
 
     if authors_mode && !initial_authors.is_empty() {

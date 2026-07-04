@@ -79,6 +79,7 @@ pub struct App {
     pub author_meta: HashMap<String, (i64, usize)>,
     pub author_sort: AuthorSort,
     pub enrichment_throttle: Option<u64>,
+    pub use_chromium: bool,
 }
 
 impl App {
@@ -98,6 +99,8 @@ impl App {
             is_downloading: false,
             force_download: false,
             urls_scroll_y: 0,
+            use_chromium: false,
+
             view: AppView::Download,
             feed_articles: Vec::<(String, String, String, String)>::new(),
             feed_selected: Vec::new(),

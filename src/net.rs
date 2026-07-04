@@ -4,6 +4,9 @@ use tokio::sync::mpsc;
 use crate::app::AppEvent;
 use crate::util::{extract_slug, get_jitter_ms};
 use crate::html::{clean_article_and_collect_images, clean_markdown, inject_source_link};
+use chromiumoxide::{Browser, BrowserConfig};
+use chromiumoxide::cdp::browser_protocol::network::CookieParam;
+use futures::StreamExt;
 
 pub fn build_cookie_headers(sid: &str, uid: &str, cf_clearance: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -38,6 +41,7 @@ pub async fn perform_download(
     cf_clearance: &str,
     output_dir: &str,
     force: bool,
+    use_chromium: bool,
     tx: &mpsc::UnboundedSender<AppEvent>,
 ) -> Result<String, String> {
     let slug = extract_slug(url_str);
@@ -48,31 +52,36 @@ pub async fn perform_download(
         return Ok(format!("{} (skipped, already exists)", filename));
     }
 
-    let mut headers = build_cookie_headers(sid, uid, cf_clearance);
-    headers.insert(ACCEPT, HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8"));
+    let html_content = if use_chromium {
+        let _ = tx.send(AppEvent::Log("Fetching article via headless Chromium...".to_string()));
+        fetch_html_chromium(url_str, sid, uid, cf_clearance).await?
+    } else {
+        let mut headers = build_cookie_headers(sid, uid, cf_clearance);
+        headers.insert(ACCEPT, HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8"));
 
-    tracing::info!(url = url_str, "Starting article download");
+        tracing::info!(url = url_str, "Starting article download via reqwest");
 
-    let response = client
-        .get(url_str)
-        .headers(headers)
-        .send()
-        .await
-        .map_err(|e| {
-            tracing::error!(url = url_str, error = %e, "Network request failed");
-            format!("Network request failed: {}", e)
-        })?;
+        let response = client
+            .get(url_str)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::error!(url = url_str, error = %e, "Network request failed");
+                format!("Network request failed: {}", e)
+            })?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        tracing::error!(url = url_str, status = %status, "HTTP error");
-        return Err(format!("HTTP Error: {}", status));
-    }
+        if !response.status().is_success() {
+            let status = response.status();
+            tracing::error!(url = url_str, status = %status, "HTTP error");
+            return Err(format!("HTTP Error: {}", status));
+        }
 
-    let html_content = response
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read response body: {}", e))?;
+        response
+            .text()
+            .await
+            .map_err(|e| format!("Failed to read response body: {}", e))?
+    };
 
     let images_dir_basename = format!("{}_images", slug);
     let images_dir_path = format!("{}/{}", output_dir, images_dir_basename);
@@ -142,4 +151,109 @@ pub async fn perform_download(
     }
 
     Ok(filename)
+}
+
+pub async fn fetch_html_chromium(
+    url_str: &str,
+    sid: &str,
+    uid: &str,
+    cf_clearance: &str,
+) -> Result<String, String> {
+    let config = BrowserConfig::builder()
+        .chrome_executable("/usr/bin/chromium")
+        .arg("--headless")
+        .arg("--no-sandbox")
+        .arg("--disable-gpu")
+        .build()
+        .map_err(|e| format!("Failed to build browser config: {}", e))?;
+
+    let (mut browser, mut handler) = Browser::launch(config)
+        .await
+        .map_err(|e| format!("Failed to launch Chromium: {}", e))?;
+
+    let handle = tokio::spawn(async move {
+        while let Some(h) = handler.next().await {
+            if h.is_err() {
+                break;
+            }
+        }
+    });
+
+    let page = browser
+        .new_page("about:blank")
+        .await
+        .map_err(|e| format!("Failed to create new page: {}", e))?;
+
+    // Navigate to medium.com domain first, so we can set cookies for it
+    if let Err(e) = page.goto("https://medium.com").await {
+        tracing::warn!("Initial navigation to medium.com failed (this is expected if unauthenticated): {}", e);
+    }
+
+    // Set the provided cookies
+    if !sid.is_empty() {
+        let cookie = CookieParam::builder()
+            .name("sid")
+            .value(sid)
+            .domain(".medium.com")
+            .path("/")
+            .secure(true)
+            .build()
+            .map_err(|e| format!("Failed to build sid cookie param: {}", e))?;
+        page.set_cookie(cookie)
+            .await
+            .map_err(|e| format!("Failed to set sid cookie: {}", e))?;
+    }
+    if !uid.is_empty() {
+        let cookie = CookieParam::builder()
+            .name("uid")
+            .value(uid)
+            .domain(".medium.com")
+            .path("/")
+            .secure(true)
+            .build()
+            .map_err(|e| format!("Failed to build uid cookie param: {}", e))?;
+        page.set_cookie(cookie)
+            .await
+            .map_err(|e| format!("Failed to set uid cookie: {}", e))?;
+    }
+    if !cf_clearance.is_empty() {
+        let cookie = CookieParam::builder()
+            .name("cf_clearance")
+            .value(cf_clearance)
+            .domain(".medium.com")
+            .path("/")
+            .secure(true)
+            .build()
+            .map_err(|e| format!("Failed to build cf_clearance cookie param: {}", e))?;
+        page.set_cookie(cookie)
+            .await
+            .map_err(|e| format!("Failed to set cf_clearance cookie: {}", e))?;
+    }
+
+    // Navigate to the target page URL
+    page.goto(url_str)
+        .await
+        .map_err(|e| format!("Failed to navigate to target URL: {}", e))?;
+
+    // Wait for the page content to load. Since Medium dynamically renders content,
+    // we wait for the <article> element. We'll poll for it up to 5 seconds.
+    let poll_start = std::time::Instant::now();
+    while poll_start.elapsed() < std::time::Duration::from_secs(5) {
+        if page.find_element("article").await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+    }
+
+    // Get rendered HTML
+    let html = page
+        .content()
+        .await
+        .map_err(|e| format!("Failed to get page content: {}", e))?;
+
+    // Clean up
+    let _ = browser.close().await;
+    let _ = handle.await;
+
+    Ok(html)
 }
