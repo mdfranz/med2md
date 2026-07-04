@@ -15,8 +15,8 @@ The dependencies can be grouped into the following functional categories:
 | **Terminal UI (TUI)** | `ratatui`, `crossterm`, `tui-markdown` | Terminal drawing, event loop management, and formatted preview rendering. |
 | **HTML Parsing & DOM** | `scraper`, `ego-tree`, `markup5ever` | Scraping Web DOM components and querying selectors. |
 | **Markup Conversion** | `html2md` | HTML-to-Markdown translation engine. |
-| **Data Serialization** | `serde_json`, `url` | JSON payload analysis and URL query cleaning. |
-| **Utilities & Logging** | `chrono`, `rpassword`, `tracing`, `tracing-subscriber` | Time formatting, hidden input, and JSON structured logs. |
+| **Data Serialization** | `serde_json`, `serde`, `url` | JSON payload analysis, event-channel struct (de)serialization, and URL query cleaning. |
+| **Utilities & Logging** | `chrono`, `rpassword`, `tracing`, `tracing-subscriber`, `regex` | Time formatting, hidden input, JSON structured logs, and article-slug pattern matching. |
 
 ---
 
@@ -91,6 +91,14 @@ The dependencies can be grouped into the following functional categories:
 #### `serde_json` (v1)
 *   **Purpose**: JSON parsing and serialization.
 *   **Usage**: Used to strip XSSI security prefixes from Medium's API JSON payloads, extract GraphQL Apollo state nodes in [src/feed.rs](src/feed.rs), and serialize/deserialize cache data (defined in [src/cache.rs](src/cache.rs)).
+
+#### `serde` (v1, `derive` feature)
+*   **Purpose**: The core (de)serialization trait/derive-macro framework `serde_json` builds on.
+*   **Usage**: Derives `Serialize`/`Deserialize` on the `LinkKind` and `BrowserLink` types (defined in [src/browser.rs#L5](src/browser.rs#L5) and [src/browser.rs#L13](src/browser.rs#L13)) so browser links can be passed across `AppEvent` channels and cached like other structured data.
+
+#### `regex` (v1)
+*   **Purpose**: Regular expression matching.
+*   **Usage**: Matches Medium's trailing hex-slug pattern (`-[a-f0-9]{10,12}$`) to classify article vs. non-article links while scraping browser pages (defined in [src/browser.rs#L344](src/browser.rs#L344)).
 
 ---
 
