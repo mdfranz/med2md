@@ -8,6 +8,7 @@ A terminal UI for downloading Medium articles (including member-only content) as
 
 - Download individual article URLs or bulk-select from your following feed
 - Browse followed authors and fetch their recent articles
+- Interactive TUI web browser for navigating Medium and multi-selecting articles to download
 - Full-resolution images extracted and saved alongside each article
 - Local JSON cache for authors/feeds to avoid redundant network calls
 - In-app Markdown preview with syntax-aware rendering
@@ -33,6 +34,7 @@ med2md --dir <path>       Output directory for downloaded articles (default: ~/.
 med2md --browse           Browse already-downloaded markdown files
 med2md --force            Re-download articles even if they already exist
 med2md --refresh          Ignore cache and re-fetch authors/feed from Medium
+med2md --web              Launch TUI web browser to browse and select articles
 med2md --log <path>       Write JSON logs to <path> (default: medium.log)
 ```
 
@@ -51,7 +53,7 @@ If unset, `med2md` will prompt interactively for cookies on startup.
 ## Documentation
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — system diagrams, async layers, and the article parsing pipeline
-- [MEDIUM.md](MEDIUM.md) — how med2md authenticates with and scrapes Medium
+- [references/MEDIUM.md](references/MEDIUM.md) — how med2md authenticates with and scrapes Medium
 - [PKG.md](PKG.md) — external crates and why each is used
 - [PROJECT.md](PROJECT.md) — feature history and codebase evolution
 - [AGENTS.md](AGENTS.md) — instructions for AI coding agents working in this repo

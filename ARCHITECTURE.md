@@ -110,7 +110,7 @@ The codebase is modularized into discrete sub-modules under `src/` to separate T
 
 ### A. State Management, UI & Event Handling
 *   **[src/main.rs](src/main.rs)**: The application entry point. Parses command line arguments, initializes tracing instrumentation, sets up cookie authentication, and runs the terminal event loop.
-*   **[src/app.rs](src/app.rs)**: Defines the central structures [App](src/app.rs#L60) (global application state), [AppView](src/app.rs#L30) (UI view variants: `Download`, `Picker`, `FeedSelector`, `AuthorBrowser`, `Loading`), and [AppEvent](src/app.rs#L51) (async channels communication event enumeration).
+*   **[src/app.rs](src/app.rs)**: Defines the central structures [App](src/app.rs#L60) (global application state), [AppView](src/app.rs#L30) (UI view variants: `Download`, `Picker`, `FeedSelector`, `AuthorBrowser`, `Loading`, `Browser`), and [AppEvent](src/app.rs#L51) (async channels communication event enumeration).
 *   **[src/ui.rs](src/ui.rs)**: Renders TUI frames and subcomponents in [draw_ui](src/ui.rs#L78) using Ratatui layout splits, block borders, lists, and formatted paragraphs.
 *   **[src/input.rs](src/input.rs)**: Listens for key events and triggers actions in [handle_key](src/input.rs#L277), cleans multi-line URL payloads via [handle_paste](src/input.rs#L128), and kicks off async download loops in [start_download](src/input.rs#L423).
 
@@ -120,6 +120,7 @@ The codebase is modularized into discrete sub-modules under `src/` to separate T
 *   **[src/articles.rs](src/articles.rs)**: Queries user-specific author articles utilizing Medium API pagination limits and fallback RSS scraping.
 *   **[src/feed.rs](src/feed.rs)**: Strips XSSI security wrappers from JSON responses, parses Apollo GraphQL states, and parses XML RSS feeds.
 *   **[src/net.rs](src/net.rs)**: Defines common reqwest headers and manages sequential article downloading in [perform_download](src/net.rs#L33).
+*   **[src/browser.rs](src/browser.rs)**: Drives the `AppView::Browser` interactive TUI browser in `run_browser_task`, dispatching each navigated URL to the landing-page/RSS/HTML-scrape strategy that best avoids Cloudflare gating, and streams incremental link updates back to the UI.
 
 ### C. Processing, Formatting & Storage
 *   **[src/html.rs](src/html.rs)**: Houses the parsing and DOM cleaning routines including [clean_article](src/html.rs#L70) (element extraction, detach nodes) and [clean_article_and_collect_images](src/html.rs#L253) (srcset extraction, relative target path rewriting).

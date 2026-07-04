@@ -285,10 +285,18 @@ pub fn handle_key(
     if matches!(app.view, AppView::AuthorBrowser { .. }) {
         return handle_author_browser_key(app, key, tx);
     }
+    if matches!(app.view, AppView::Browser { .. }) {
+        return handle_browser_key(app, key, tx);
+    }
     if matches!(app.view, AppView::Loading { .. }) {
         if key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) {
             return true;
         }
+        return false;
+    }
+
+    if key.code == KeyCode::Char('w') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        enter_browser_mode(app, tx.clone());
         return false;
     }
 
@@ -304,7 +312,7 @@ pub fn handle_key(
             AppView::Picker { .. } => {
                 app.view = AppView::Download;
             }
-            AppView::FeedSelector | AppView::AuthorBrowser { .. } | AppView::Loading { .. } => {}
+            AppView::FeedSelector | AppView::AuthorBrowser { .. } | AppView::Loading { .. } | AppView::Browser { .. } => {}
         }
         return false;
     }
@@ -379,7 +387,7 @@ pub fn handle_key(
                 _ => {}
             }
         }
-        AppView::FeedSelector | AppView::AuthorBrowser { .. } | AppView::Loading { .. } => {}
+        AppView::FeedSelector | AppView::AuthorBrowser { .. } | AppView::Loading { .. } | AppView::Browser { .. } => {}
     }
     false
 }
@@ -485,4 +493,170 @@ pub fn start_download(app: &mut App, tx: mpsc::UnboundedSender<AppEvent>) {
         let _ = tx.send(AppEvent::Log("All tasks completed.".to_string()));
         let _ = tx.send(AppEvent::DownloadFinished);
     });
+}
+
+pub fn enter_browser_mode(app: &mut App, tx: mpsc::UnboundedSender<AppEvent>) {
+    if app.browser_tx.is_some() {
+        app.view = AppView::Browser {
+            current_url: "https://medium.com/me/feed".to_string(),
+            links: Vec::new(),
+            selected_idx: 0,
+            scroll_offset: 0,
+            selected: std::collections::HashSet::new(),
+        };
+        let _ = app.browser_tx.as_ref().unwrap().send(crate::browser::BrowserCommand::Navigate("https://medium.com/me/feed".to_string()));
+        return;
+    }
+
+    app.view = AppView::Loading { message: "Launching TUI Browser...".to_string() };
+    let (browser_tx, browser_rx) = mpsc::unbounded_channel::<crate::browser::BrowserCommand>();
+    app.browser_tx = Some(browser_tx);
+
+    let sid = app.sid.clone();
+    let uid = app.uid.clone();
+    let cf = app.cf_clearance.clone();
+    let initial_url = "https://medium.com/me/feed".to_string();
+
+    tokio::spawn(async move {
+        crate::browser::run_browser_task(sid, uid, cf, initial_url, tx, browser_rx).await;
+    });
+}
+
+pub fn handle_browser_key(
+    app: &mut App,
+    key: KeyEvent,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) -> bool {
+    if key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) {
+        app.view = AppView::Download;
+        return false;
+    }
+
+    enum BrowserAction {
+        None,
+        GoBack,
+        ScrollDown,
+        Navigate(String),
+        DownloadArticle(String, String),
+        PopulateDownloader(Vec<String>),
+    }
+
+    let mut action = BrowserAction::None;
+
+    if let AppView::Browser {
+        current_url: _,
+        links,
+        selected_idx,
+        scroll_offset,
+        selected,
+    } = &mut app.view
+    {
+        match key.code {
+            KeyCode::Up => {
+                if *selected_idx > 0 {
+                    *selected_idx -= 1;
+                    if *selected_idx < *scroll_offset {
+                        *scroll_offset = *selected_idx;
+                    }
+                }
+            }
+            KeyCode::Down => {
+                if !links.is_empty() && *selected_idx < links.len() - 1 {
+                    *selected_idx += 1;
+                    if *selected_idx >= *scroll_offset + 20 {
+                        *scroll_offset = *selected_idx - 19;
+                    }
+                }
+            }
+            KeyCode::Char('b') | KeyCode::Backspace => {
+                action = BrowserAction::GoBack;
+            }
+            KeyCode::PageDown => {
+                action = BrowserAction::ScrollDown;
+            }
+            KeyCode::Char(' ') => {
+                if let Some(link) = links.get(*selected_idx) {
+                    if link.kind == crate::browser::LinkKind::Article {
+                        if !selected.remove(&link.url) {
+                            selected.insert(link.url.clone());
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('a') => {
+                let article_urls: Vec<&String> = links.iter()
+                    .filter(|l| l.kind == crate::browser::LinkKind::Article)
+                    .map(|l| &l.url)
+                    .collect();
+                let all_selected = !article_urls.is_empty() && article_urls.iter().all(|u| selected.contains(*u));
+                if all_selected {
+                    selected.clear();
+                } else {
+                    for u in article_urls {
+                        selected.insert(u.clone());
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                if !selected.is_empty() {
+                    let urls: Vec<String> = links.iter()
+                        .filter(|l| selected.contains(&l.url))
+                        .map(|l| l.url.clone())
+                        .collect();
+                    action = BrowserAction::PopulateDownloader(urls);
+                } else if !links.is_empty() {
+                    let link = &links[*selected_idx];
+                    match link.kind {
+                        crate::browser::LinkKind::Article => {
+                            action = BrowserAction::DownloadArticle(link.url.clone(), link.text.clone());
+                        }
+                        _ => {
+                            action = BrowserAction::Navigate(link.url.clone());
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('d') => {
+                if !links.is_empty() {
+                    let link = &links[*selected_idx];
+                    action = BrowserAction::DownloadArticle(link.url.clone(), link.text.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    match action {
+        BrowserAction::None => {}
+        BrowserAction::GoBack => {
+            if let Some(btx) = &app.browser_tx {
+                let _ = btx.send(crate::browser::BrowserCommand::GoBack);
+            }
+        }
+        BrowserAction::ScrollDown => {
+            if let Some(btx) = &app.browser_tx {
+                let _ = btx.send(crate::browser::BrowserCommand::ScrollDown);
+            }
+        }
+        BrowserAction::Navigate(url) => {
+            if let Some(btx) = &app.browser_tx {
+                let _ = btx.send(crate::browser::BrowserCommand::Navigate(url));
+            }
+        }
+        BrowserAction::DownloadArticle(url, text) => {
+            app.urls = vec![url];
+            app.log(format!("Selected article from browser: {}", text));
+            start_download(app, tx);
+        }
+        BrowserAction::PopulateDownloader(urls) => {
+            let n = urls.len();
+            app.urls = urls;
+            app.cursor_x = 0;
+            app.cursor_y = 0;
+            app.log(format!("Loaded {} selected article(s) from browser into downloader.", n));
+            app.view = AppView::Download;
+        }
+    }
+
+    false
 }

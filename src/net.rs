@@ -48,31 +48,33 @@ pub async fn perform_download(
         return Ok(format!("{} (skipped, already exists)", filename));
     }
 
-    let mut headers = build_cookie_headers(sid, uid, cf_clearance);
-    headers.insert(ACCEPT, HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8"));
+    let html_content = {
+        let mut headers = build_cookie_headers(sid, uid, cf_clearance);
+        headers.insert(ACCEPT, HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8"));
 
-    tracing::info!(url = url_str, "Starting article download");
+        tracing::info!(url = url_str, "Starting article download via reqwest");
 
-    let response = client
-        .get(url_str)
-        .headers(headers)
-        .send()
-        .await
-        .map_err(|e| {
-            tracing::error!(url = url_str, error = %e, "Network request failed");
-            format!("Network request failed: {}", e)
-        })?;
+        let response = client
+            .get(url_str)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::error!(url = url_str, error = %e, "Network request failed");
+                format!("Network request failed: {}", e)
+            })?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        tracing::error!(url = url_str, status = %status, "HTTP error");
-        return Err(format!("HTTP Error: {}", status));
-    }
+        if !response.status().is_success() {
+            let status = response.status();
+            tracing::error!(url = url_str, status = %status, "HTTP error");
+            return Err(format!("HTTP Error: {}", status));
+        }
 
-    let html_content = response
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read response body: {}", e))?;
+        response
+            .text()
+            .await
+            .map_err(|e| format!("Failed to read response body: {}", e))?
+    };
 
     let images_dir_basename = format!("{}_images", slug);
     let images_dir_path = format!("{}/{}", output_dir, images_dir_basename);
@@ -143,3 +145,4 @@ pub async fn perform_download(
 
     Ok(filename)
 }
+
