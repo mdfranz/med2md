@@ -503,6 +503,7 @@ pub fn enter_browser_mode(app: &mut App, tx: mpsc::UnboundedSender<AppEvent>) {
             links: Vec::new(),
             selected_idx: 0,
             scroll_offset: 0,
+            selected: std::collections::HashSet::new(),
         };
         let _ = app.browser_tx.as_ref().unwrap().send(crate::browser::BrowserCommand::Navigate("https://medium.com/me/feed".to_string()));
         return;
@@ -538,6 +539,7 @@ pub fn handle_browser_key(
         ScrollDown,
         Navigate(String),
         DownloadArticle(String, String),
+        PopulateDownloader(Vec<String>),
     }
 
     let mut action = BrowserAction::None;
@@ -547,6 +549,7 @@ pub fn handle_browser_key(
         links,
         selected_idx,
         scroll_offset,
+        selected,
     } = &mut app.view
     {
         match key.code {
@@ -569,11 +572,40 @@ pub fn handle_browser_key(
             KeyCode::Char('b') | KeyCode::Backspace => {
                 action = BrowserAction::GoBack;
             }
-            KeyCode::PageDown | KeyCode::Char(' ') => {
+            KeyCode::PageDown => {
                 action = BrowserAction::ScrollDown;
             }
+            KeyCode::Char(' ') => {
+                if let Some(link) = links.get(*selected_idx) {
+                    if link.kind == crate::browser::LinkKind::Article {
+                        if !selected.remove(&link.url) {
+                            selected.insert(link.url.clone());
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('a') => {
+                let article_urls: Vec<&String> = links.iter()
+                    .filter(|l| l.kind == crate::browser::LinkKind::Article)
+                    .map(|l| &l.url)
+                    .collect();
+                let all_selected = !article_urls.is_empty() && article_urls.iter().all(|u| selected.contains(*u));
+                if all_selected {
+                    selected.clear();
+                } else {
+                    for u in article_urls {
+                        selected.insert(u.clone());
+                    }
+                }
+            }
             KeyCode::Enter => {
-                if !links.is_empty() {
+                if !selected.is_empty() {
+                    let urls: Vec<String> = links.iter()
+                        .filter(|l| selected.contains(&l.url))
+                        .map(|l| l.url.clone())
+                        .collect();
+                    action = BrowserAction::PopulateDownloader(urls);
+                } else if !links.is_empty() {
                     let link = &links[*selected_idx];
                     match link.kind {
                         crate::browser::LinkKind::Article => {
@@ -616,6 +648,14 @@ pub fn handle_browser_key(
             app.urls = vec![url];
             app.log(format!("Selected article from browser: {}", text));
             start_download(app, tx);
+        }
+        BrowserAction::PopulateDownloader(urls) => {
+            let n = urls.len();
+            app.urls = urls;
+            app.cursor_x = 0;
+            app.cursor_y = 0;
+            app.log(format!("Loaded {} selected article(s) from browser into downloader.", n));
+            app.view = AppView::Download;
         }
     }
 

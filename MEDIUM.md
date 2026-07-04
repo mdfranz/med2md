@@ -14,6 +14,21 @@ Medium shields premium content and user feeds behind Cloudflare and cookie authe
 
 Every HTTP request is built with `build_cookie_headers` ([src/net.rs](src/net.rs)) which constructs a `HeaderMap` combining the three cookies with a modern browser `User-Agent`. Interactive cookie setup (prompting/reading env vars) lives in `setup_cookies` ([src/auth.rs](src/auth.rs)).
 
+### Which Pages Cloudflare Actually Gates
+
+A valid `cf_clearance` cookie does **not** unblock every page — Cloudflare's WAF applies per-route rules, verified by direct request testing:
+
+| URL pattern | Result with valid cookies |
+|---|---|
+| `medium.com/me/feed` | 200 OK |
+| `medium.com/feed/@{username}` (RSS) | 200 OK |
+| `medium.com/feed/{publication_slug}` (RSS) | 200 OK |
+| Individual article pages (incl. `{user}.medium.com/...` custom subdomains) | 200 OK |
+| `medium.com/@{username}` (profile page HTML) | **403** — Cloudflare JS "Just a moment..." managed challenge |
+| `medium.com/me/following-feed/all` | **403** — same managed challenge |
+
+The practical rule of thumb: plain HTML GETs to profile/publication *listing* pages get challenged regardless of cookies, but the RSS feed for that same account does not. Every content-discovery path in this codebase (`fetch_following_feed`, `fetch_rss_for_authors`, the `--web` browser) is designed around this — falling back to RSS instead of scraping profile HTML whenever a per-author/publication article list is needed. `fetch_following_list` ([src/following.rs](src/following.rs)) still tries `/me/following-feed/all` and `/@{username}/following` as candidates since Cloudflare's behavior isn't guaranteed stable, but treat their success as opportunistic, not relied-upon.
+
 ---
 
 ## 2. Content Discovery
@@ -139,7 +154,21 @@ Medium serves responsive images using `<picture>` / `<source srcset="...">` mark
 
 ---
 
-## 6. Storage Layout
+## 6. Interactive Web Browser (`--web`)
+
+`run_browser_task` ([src/browser.rs](src/browser.rs)) drives the `AppView::Browser` TUI view: it fetches a URL, extracts links, and waits for the next `BrowserCommand` (`Navigate`, `GoBack`, `ScrollDown`) sent by keyboard input in [src/input.rs](src/input.rs).
+
+Because of the Cloudflare gating described above, this module cannot simply GET whatever URL the user navigates to — it dispatches based on URL shape:
+
+- **`https://medium.com/me/feed`** (the landing page): handled by `load_full_feed`, which first scrapes the page's own Apollo state/`<a>` tags via `fetch_and_parse` (a handful of server-rendered articles plus the list of followed authors/publications as `Author`-kind links), then walks every followed author/publication found and pulls their RSS feed too (`fetch_rss_links`), merging everything into one recency-sorted, directly-selectable article list — the same technique `--feed` uses, just run lazily inside the browser. A 1.2s-jittered delay separates each RSS request to avoid rate-limiting; author/publication links stay in the list afterward for optional drill-down, and progress is streamed to the log pane (`[n/total] +k articles`).
+- **Author/publication profile URLs** (`medium.com/@user`, `medium.com/{pub-slug}`, `{user}.medium.com/`): `rss_url_for_profile` maps the URL to its RSS feed, and `fetch_rss_links` is used instead of scraping the (Cloudflare-gated) HTML. Falls back to the HTML scrape only if the RSS fetch fails or is empty.
+- **Everything else** (individual articles, nav/footer links, tag pages): falls through to `fetch_and_parse`, the original raw-HTML + Apollo-state scrape.
+
+`is_boilerplate_url` filters out known non-content links (sitemap, careers, store, etc.) before they ever become candidate `Author`/`Feed` entries.
+
+---
+
+## 7. Storage Layout
 
 Default output directory: `~/.local/med2md/` (XDG-compliant; overridable via `--dir` or `MEDIUM_DIR`).
 

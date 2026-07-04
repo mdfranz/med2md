@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use crate::browser::{BrowserLink, BrowserCommand};
 
 pub enum PickerPane {
@@ -52,6 +52,7 @@ pub enum AppView {
         links: Vec<BrowserLink>,
         selected_idx: usize,
         scroll_offset: usize,
+        selected: HashSet<String>,
     },
 }
 
@@ -63,6 +64,10 @@ pub enum AppEvent {
     EnrichmentThrottled(u64),
     EnrichmentDone,
     BrowserReady {
+        url: String,
+        links: Vec<BrowserLink>,
+    },
+    BrowserLinksUpdated {
         url: String,
         links: Vec<BrowserLink>,
     },

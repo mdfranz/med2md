@@ -257,7 +257,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         links,
                         selected_idx: 0,
                         scroll_offset: 0,
+                        selected: std::collections::HashSet::new(),
                     };
+                }
+                AppEvent::BrowserLinksUpdated { url, links } => {
+                    if let AppView::Browser { current_url, links: cur_links, selected_idx, scroll_offset, .. } = &mut app.view {
+                        if *current_url == url {
+                            *cur_links = links;
+                            let max_idx = cur_links.len().saturating_sub(1);
+                            *selected_idx = (*selected_idx).min(max_idx);
+                            *scroll_offset = (*scroll_offset).min(max_idx);
+                        }
+                    }
                 }
             }
         }

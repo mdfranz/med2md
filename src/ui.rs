@@ -293,10 +293,11 @@ pub fn draw_ui(f: &mut Frame, app: &mut App) {
         links,
         selected_idx,
         scroll_offset,
+        selected,
     } = &app.view
     {
         let list_block = Block::default()
-            .title(format!(" Headless TUI Browser — {} links found ", links.len()))
+            .title(format!(" Headless TUI Browser — {} links found, {} selected ", links.len(), selected.len()))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::Yellow));
@@ -311,6 +312,7 @@ pub fn draw_ui(f: &mut Frame, app: &mut App) {
             .map(|(rel, link)| {
                 let abs = start + rel;
                 let is_selected = abs == *selected_idx;
+                let is_checked = selected.contains(&link.url);
 
                 let (kind_str, kind_color) = match link.kind {
                     crate::browser::LinkKind::Article => (" [Art] ", Color::Green),
@@ -321,14 +323,26 @@ pub fn draw_ui(f: &mut Frame, app: &mut App) {
 
                 let style = if is_selected {
                     Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else if is_checked {
+                    Style::default().fg(Color::Green)
                 } else {
                     Style::default().fg(Color::White)
                 };
 
+                let checkbox = if link.kind == crate::browser::LinkKind::Article {
+                    if is_checked { "[x] " } else { "[ ] " }
+                } else {
+                    "    "
+                };
+
                 let mut spans = vec![
+                    Span::styled(checkbox, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
                     Span::styled(kind_str, Style::default().fg(kind_color).add_modifier(Modifier::BOLD)),
-                    Span::styled(link.text.clone(), style),
                 ];
+                if !link.date.is_empty() {
+                    spans.push(Span::styled(format!("{} ", link.date), Style::default().fg(Color::DarkGray)));
+                }
+                spans.push(Span::styled(link.text.clone(), style));
                 if !is_selected {
                     spans.push(Span::styled(format!(" ({})", link.url), Style::default().fg(Color::DarkGray)));
                 }
@@ -354,7 +368,7 @@ pub fn draw_ui(f: &mut Frame, app: &mut App) {
         f.render_widget(url_p, browser_chunks[0]);
         f.render_widget(list, browser_chunks[1]);
 
-        let footer_text = "  [↑↓] Select  [Enter] Follow/Download  [D] Force Download  [Backsp/B] Back  [Space/PgDn] Scroll Down  [Esc] Exit  [Ctrl+C] Quit";
+        let footer_text = "  [↑↓] Move  [Space] Toggle  [A] Select All  [Enter] Load Selected/Follow/Download  [D] Quick Download  [Backsp/B] Back  [Esc] Exit  [Ctrl+C] Quit";
         let footer_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
