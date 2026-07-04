@@ -10,12 +10,13 @@ The dependencies can be grouped into the following functional categories:
 
 | Category | Crate Name | Description |
 | :--- | :--- | :--- |
-| **Async Runtime** | `tokio` | Async runtime for non-blocking I/O execution. |
+| **Async Runtime** | `tokio`, `futures` | Async runtime for non-blocking I/O execution and async combinators. |
 | **Network & Protocol** | `reqwest`, `rss` | HTTP client execution and RSS feed extraction. |
 | **Terminal UI (TUI)** | `ratatui`, `crossterm`, `tui-markdown` | Terminal drawing, event loop management, and formatted preview rendering. |
 | **HTML Parsing & DOM** | `scraper`, `ego-tree`, `markup5ever` | Scraping Web DOM components and querying selectors. |
 | **Markup Conversion** | `html2md` | HTML-to-Markdown translation engine. |
 | **Data Serialization** | `serde_json`, `serde`, `url` | JSON payload analysis, event-channel struct (de)serialization, and URL query cleaning. |
+| **RAG & LLM** | `rig-core`, `rig-lancedb`, `lancedb`, `arrow-array`, `arrow-schema` | Retrieval-augmented generation framework, vector DB integration, and columnar data structures. |
 | **Utilities & Logging** | `chrono`, `rpassword`, `tracing`, `tracing-subscriber`, `regex` | Time formatting, hidden input, JSON structured logs, and article-slug pattern matching. |
 
 ---
@@ -102,7 +103,31 @@ The dependencies can be grouped into the following functional categories:
 
 ---
 
-### F. Observability & Security
+### G. Retrieval-Augmented Generation (RAG) & Large Language Models
+
+#### `rig-core` (v0.39)
+*   **Purpose**: Core framework for building retrieval-augmented generation (RAG) applications.
+*   **Usage**: Provides the foundational abstractions for LLM integrations and RAG pipelines used in [src/rag/](src/rag/).
+
+#### `rig-lancedb` (v0.39)
+*   **Purpose**: LanceDB integration for the Rig framework.
+*   **Usage**: Bridges Rig's RAG capabilities with LanceDB vector database operations for semantic search and retrieval in [src/rag/query.rs](src/rag/query.rs).
+
+#### `lancedb` (v0.30)
+*   **Purpose**: Vector database for fast similarity search on embeddings.
+*   **Usage**: Stores and queries article embeddings. Used in [src/rag/ingest.rs](src/rag/ingest.rs) for ingesting indexed articles and [src/rag/query.rs](src/rag/query.rs) for retrieval.
+
+#### `arrow-array` (v58.0.0) & `arrow-schema` (v58.0.0)
+*   **Purpose**: Apache Arrow columnar data structures and schema definitions.
+*   **Usage**: Underlying data format used by LanceDB for efficient in-memory and on-disk representation of embeddings and article metadata in [src/rag/schema.rs](src/rag/schema.rs).
+
+#### `futures` (v0.3)
+*   **Purpose**: Async/await utilities and combinators.
+*   **Usage**: Provides higher-level async abstractions complementing Tokio for composing concurrent operations in RAG ingest and query pipelines.
+
+---
+
+### H. Observability & Security
 
 #### `tracing` (v0.1) & `tracing-subscriber` (v0.3)
 *   **Purpose**: Diagnostics, instrumentation, and structured event logging.

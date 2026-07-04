@@ -17,6 +17,12 @@ use input::{handle_key, handle_paste, enter_picker_view};
 mod ui;
 use ui::draw_ui;
 mod browser;
+mod llm_config;
+mod embed;
+mod chat;
+mod rag;
+use chat::ChatProvider;
+use embed::EmbedProvider;
 
 use std::io;
 use std::time::Duration;
@@ -44,13 +50,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  med2md --force            Re-download articles even if they already exist");
         println!("  med2md --refresh          Ignore cache and re-fetch authors/feed from Medium");
         println!("  med2md --web              Launch TUI web browser to browse and select articles");
-        println!("  med2md --log <path>       Write JSON logs to <path> (default: medium.log)\n");
+        println!("  med2md --log <path>       Write JSON logs to <path> (default: medium.log)");
+        println!("  med2md --index            Index downloaded markdown into the local RAG vector store, then exit");
+        println!("  med2md --chat-provider <p>   Chat completion provider: openai, anthropic, gemini (default: anthropic)");
+        println!("  med2md --chat-model <m>      Chat completion model (default: claude-sonnet-4-5)");
+        println!("  med2md --embed-provider <p>  Embedding provider: openai, gemini (default: openai)");
+        println!("  med2md --embed-model <m>     Embedding model (default: text-embedding-3-small)\n");
         println!("ENVIRONMENT VARIABLES:");
         println!("  MEDIUM_SID          Your Medium session cookie (required for member-only content)");
         println!("  MEDIUM_UID          Your Medium user ID cookie (improves --authors completeness)");
         println!("  MEDIUM_USERNAME     Your Medium @username (helps --authors find /@user/following)");
         println!("  MEDIUM_CF_CLEARANCE Cloudflare clearance cookie (required for --feed and most content)");
         println!("  MEDIUM_DIR          Output directory for downloaded articles (default: ~/.local/med2md)");
+        println!("  MED2MD_CHAT_PROVIDER   Chat completion provider (default: anthropic)");
+        println!("  MED2MD_CHAT_MODEL      Chat completion model (default: claude-sonnet-4-5)");
+        println!("  MED2MD_EMBED_PROVIDER  Embedding provider (default: openai)");
+        println!("  MED2MD_EMBED_MODEL     Embedding model (default: text-embedding-3-small)");
+        println!("  OPENAI_API_KEY / ANTHROPIC_API_KEY / GEMINI_API_KEY   API key for the selected provider(s)");
         return Ok(());
     }
 
@@ -81,6 +97,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let browse_mode = args.iter().any(|a| a == "--browse");
     let refresh = args.iter().any(|a| a == "--refresh");
     let web_mode = args.iter().any(|a| a == "--web");
+    let index_mode = args.iter().any(|a| a == "--index");
+
+    let chat_provider_arg = args.windows(2).find(|w| w[0] == "--chat-provider").map(|w| w[1].clone());
+    let chat_model_arg = args.windows(2).find(|w| w[0] == "--chat-model").map(|w| w[1].clone());
+    let embed_provider_arg = args.windows(2).find(|w| w[0] == "--embed-provider").map(|w| w[1].clone());
+    let embed_model_arg = args.windows(2).find(|w| w[0] == "--embed-model").map(|w| w[1].clone());
+
+    let output_dir_early = args.windows(2)
+        .find(|w| w[0] == "--dir")
+        .map(|w| w[1].clone())
+        .or_else(|| std::env::var("MEDIUM_DIR").ok())
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            format!("{}/.local/med2md", home)
+        });
+
+    if index_mode {
+        let embed_config = match llm_config::load_embed_config(embed_provider_arg, embed_model_arg) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = rag::ingest::run_index(&output_dir_early, &embed_config).await {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
     let (sid, uid, cf_clearance) = setup_cookies().await;
 
@@ -91,14 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let output_dir = args.windows(2)
-        .find(|w| w[0] == "--dir")
-        .map(|w| w[1].clone())
-        .or_else(|| std::env::var("MEDIUM_DIR").ok())
-        .unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            format!("{}/.local/med2md", home)
-        });
+    let output_dir = output_dir_early;
 
     let cache_dir = format!("{}/.cache", output_dir);
 
@@ -163,6 +202,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut app = App::new(sid, uid, cf_clearance, output_dir);
     app.force_download = force_download;
+
+    match llm_config::load_chat_config(chat_provider_arg, chat_model_arg) {
+        Ok(chat_config) => match ChatProvider::build(&chat_config) {
+            Ok(provider) => {
+                app.chat_model = chat_config.model;
+                app.chat_provider = Some(std::sync::Arc::new(provider));
+            }
+            Err(e) => app.log(format!("Warning: Chat unavailable: {}", e)),
+        },
+        Err(e) => app.log(format!("Warning: Chat unavailable: {}", e)),
+    }
+
+    match llm_config::load_embed_config(embed_provider_arg, embed_model_arg) {
+        Ok(embed_config) => match EmbedProvider::build(&embed_config) {
+            Ok(embed_provider) => {
+                if let Some(table) = rag::schema::open_existing_table(&app.output_dir).await {
+                    match rig_lancedb::LanceDbVectorIndex::new(
+                        table,
+                        embed_provider,
+                        "id",
+                        rig_lancedb::SearchParams::default(),
+                    )
+                    .await
+                    {
+                        Ok(index) => app.rag_index = Some(std::sync::Arc::new(index)),
+                        Err(e) => app.log(format!("Warning: Failed to open RAG index: {}", e)),
+                    }
+                }
+            }
+            Err(e) => app.log(format!("Warning: Embeddings unavailable: {}", e)),
+        },
+        Err(e) => app.log(format!("Warning: Embeddings unavailable: {}", e)),
+    }
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
 
@@ -261,6 +333,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             *selected_idx = (*selected_idx).min(max_idx);
                             *scroll_offset = (*scroll_offset).min(max_idx);
                         }
+                    }
+                }
+                AppEvent::ChatToken(token) => {
+                    if let AppView::Chat { messages, .. } = &mut app.view {
+                        match messages.last_mut() {
+                            Some(app::ChatMessage { role: app::ChatRole::Assistant, content }) => {
+                                content.push_str(&token);
+                            }
+                            _ => {
+                                messages.push(app::ChatMessage { role: app::ChatRole::Assistant, content: token });
+                            }
+                        }
+                    }
+                }
+                AppEvent::ChatTurnDone(history) => {
+                    if let AppView::Chat { is_streaming, rag_history, .. } = &mut app.view {
+                        *is_streaming = false;
+                        *rag_history = history;
+                    }
+                }
+                AppEvent::ChatError(err) => {
+                    app.log(format!("Error: {}", err));
+                    if let AppView::Chat { is_streaming, .. } = &mut app.view {
+                        *is_streaming = false;
                     }
                 }
             }

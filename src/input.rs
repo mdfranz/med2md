@@ -1,12 +1,15 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc;
-use crate::app::{App, AppView, AppEvent};
+use crate::app::{App, AppView, AppEvent, ChatMessage, ChatRole};
 use crate::util::{get_char_byte_index, get_jitter_ms};
 use crate::app::{compute_display_order, AuthorSort, PickerPane};
 use crate::markdown::{load_preview_content, render_markdown};
 use crate::articles::fetch_rss_for_authors;
 use crate::following::fetch_following_feed;
 use crate::net::perform_download;
+use crate::chat::ChatStreamEvent;
+use crate::rag::query::{build_preamble, retrieve};
+use futures::StreamExt;
 
 pub fn handle_multiline_key(app: &mut App, key: KeyEvent) {
     let line_count = app.urls.len();
@@ -288,6 +291,9 @@ pub fn handle_key(
     if matches!(app.view, AppView::Browser { .. }) {
         return handle_browser_key(app, key, tx);
     }
+    if matches!(app.view, AppView::Chat { .. }) {
+        return handle_chat_key(app, key, tx);
+    }
     if matches!(app.view, AppView::Loading { .. }) {
         if key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) {
             return true;
@@ -297,6 +303,11 @@ pub fn handle_key(
 
     if key.code == KeyCode::Char('w') && key.modifiers.contains(KeyModifiers::CONTROL) {
         enter_browser_mode(app, tx.clone());
+        return false;
+    }
+
+    if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        enter_chat_view(app);
         return false;
     }
 
@@ -312,7 +323,7 @@ pub fn handle_key(
             AppView::Picker { .. } => {
                 app.view = AppView::Download;
             }
-            AppView::FeedSelector | AppView::AuthorBrowser { .. } | AppView::Loading { .. } | AppView::Browser { .. } => {}
+            AppView::FeedSelector | AppView::AuthorBrowser { .. } | AppView::Loading { .. } | AppView::Browser { .. } | AppView::Chat { .. } => {}
         }
         return false;
     }
@@ -387,7 +398,7 @@ pub fn handle_key(
                 _ => {}
             }
         }
-        AppView::FeedSelector | AppView::AuthorBrowser { .. } | AppView::Loading { .. } | AppView::Browser { .. } => {}
+        AppView::FeedSelector | AppView::AuthorBrowser { .. } | AppView::Loading { .. } | AppView::Browser { .. } | AppView::Chat { .. } => {}
     }
     false
 }
@@ -659,4 +670,172 @@ pub fn handle_browser_key(
     }
 
     false
+}
+
+pub fn enter_chat_view(app: &mut App) {
+    if !matches!(app.view, AppView::Chat { .. }) {
+        app.view = AppView::Chat {
+            input: String::new(),
+            cursor_x: 0,
+            messages: Vec::new(),
+            scroll_y: 0,
+            is_streaming: false,
+            rag_history: Vec::new(),
+        };
+    }
+    if app.chat_provider.is_none() {
+        app.log("Error: Chat is unavailable. Check MED2MD_CHAT_PROVIDER and the matching API key.".to_string());
+    }
+    if app.rag_index.is_none() {
+        app.log("Warning: No RAG index found. Run `med2md --index` to index downloaded articles first.".to_string());
+    }
+}
+
+pub fn handle_chat_key(app: &mut App, key: KeyEvent, tx: mpsc::UnboundedSender<AppEvent>) -> bool {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return true;
+    }
+    if key.code == KeyCode::Esc {
+        app.view = AppView::Download;
+        return false;
+    }
+
+    let is_streaming = matches!(&app.view, AppView::Chat { is_streaming, .. } if *is_streaming);
+
+    match key.code {
+        KeyCode::Char(c) => {
+            if let AppView::Chat { input, cursor_x, .. } = &mut app.view {
+                let idx = get_char_byte_index(input, *cursor_x);
+                input.insert(idx, c);
+                *cursor_x += 1;
+            }
+        }
+        KeyCode::Backspace => {
+            if let AppView::Chat { input, cursor_x, .. } = &mut app.view {
+                if *cursor_x > 0 {
+                    *cursor_x -= 1;
+                    let idx = get_char_byte_index(input, *cursor_x);
+                    input.remove(idx);
+                }
+            }
+        }
+        KeyCode::Delete => {
+            if let AppView::Chat { input, cursor_x, .. } = &mut app.view {
+                let len = input.chars().count();
+                if *cursor_x < len {
+                    let idx = get_char_byte_index(input, *cursor_x);
+                    input.remove(idx);
+                }
+            }
+        }
+        KeyCode::Left => {
+            if let AppView::Chat { cursor_x, .. } = &mut app.view {
+                *cursor_x = cursor_x.saturating_sub(1);
+            }
+        }
+        KeyCode::Right => {
+            if let AppView::Chat { input, cursor_x, .. } = &mut app.view {
+                let len = input.chars().count();
+                if *cursor_x < len {
+                    *cursor_x += 1;
+                }
+            }
+        }
+        KeyCode::Home => {
+            if let AppView::Chat { cursor_x, .. } = &mut app.view {
+                *cursor_x = 0;
+            }
+        }
+        KeyCode::End => {
+            if let AppView::Chat { input, cursor_x, .. } = &mut app.view {
+                *cursor_x = input.chars().count();
+            }
+        }
+        KeyCode::Up => {
+            if let AppView::Chat { scroll_y, .. } = &mut app.view {
+                *scroll_y = scroll_y.saturating_sub(1);
+            }
+        }
+        KeyCode::Down => {
+            if let AppView::Chat { scroll_y, .. } = &mut app.view {
+                *scroll_y += 1;
+            }
+        }
+        KeyCode::Enter => {
+            if !is_streaming {
+                start_chat_turn(app, tx);
+            }
+        }
+        _ => {}
+    }
+
+    false
+}
+
+fn start_chat_turn(app: &mut App, tx: mpsc::UnboundedSender<AppEvent>) {
+    let question = if let AppView::Chat { input, .. } = &app.view {
+        input.trim().to_string()
+    } else {
+        return;
+    };
+    if question.is_empty() {
+        return;
+    }
+
+    let Some(chat_provider) = app.chat_provider.clone() else {
+        app.log("Error: Chat is unavailable. Check MED2MD_CHAT_PROVIDER and the matching API key.".to_string());
+        return;
+    };
+    let chat_model = app.chat_model.clone();
+    let rag_index = app.rag_index.clone();
+
+    let history = if let AppView::Chat { input, cursor_x, messages, rag_history, .. } = &mut app.view {
+        messages.push(ChatMessage { role: ChatRole::User, content: question.clone() });
+        input.clear();
+        *cursor_x = 0;
+        rag_history.clone()
+    } else {
+        Vec::new()
+    };
+
+    if let AppView::Chat { is_streaming, .. } = &mut app.view {
+        *is_streaming = true;
+    }
+
+    tokio::spawn(async move {
+        let chunks = match &rag_index {
+            Some(index) => match retrieve(index, &question, 5).await {
+                Ok(chunks) => chunks,
+                Err(e) => {
+                    let _ = tx.send(AppEvent::ChatError(format!("Retrieval error: {}", e)));
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
+        let preamble = build_preamble(&chunks);
+
+        match chat_provider.stream_chat(&chat_model, &preamble, question, history).await {
+            Ok(mut stream) => {
+                while let Some(event) = stream.next().await {
+                    match event {
+                        Ok(ChatStreamEvent::Delta(text)) => {
+                            if !text.is_empty() {
+                                let _ = tx.send(AppEvent::ChatToken(text));
+                            }
+                        }
+                        Ok(ChatStreamEvent::Done { history }) => {
+                            let _ = tx.send(AppEvent::ChatTurnDone(history));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AppEvent::ChatError(e));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(AppEvent::ChatError(e));
+            }
+        }
+    });
 }

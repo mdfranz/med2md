@@ -5,8 +5,9 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap},
     Frame,
 };
-use crate::app::{compute_display_order, App, AppView, AuthorSort, PickerPane};
+use crate::app::{compute_display_order, App, AppView, AuthorSort, ChatRole, PickerPane};
 use crate::util::{extract_slug, format_date};
+use crate::markdown::render_markdown;
 
 pub fn draw_urls_field(
     rect: Rect,
@@ -98,7 +99,7 @@ pub fn draw_ui(f: &mut Frame, app: &mut App) {
     let title_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::White));
+        .border_style(Style::default().fg(Color::Reset));
     let title_p = Paragraph::new(Line::from(vec![
         Span::styled(" 📚 Medium Article Markdown Downloader ", Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow)),
         Span::raw(" (Rust TUI Edition)"),
@@ -114,7 +115,7 @@ pub fn draw_ui(f: &mut Frame, app: &mut App) {
             .title(format!(" Following Feed — {} articles, {} selected ", n_total, n_sel))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::White));
+            .border_style(Style::default().fg(Color::Reset));
 
         let inner = list_block.inner(chunks[1]);
         let height = inner.height as usize;
@@ -145,7 +146,7 @@ pub fn draw_ui(f: &mut Frame, app: &mut App) {
                 } else if already_downloaded {
                     Style::default().fg(Color::Gray).add_modifier(Modifier::CROSSED_OUT)
                 } else {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(Color::Reset)
                 };
                 let date_part = if date.is_empty() { String::new() } else { format!("[{}] ", date) };
                 let author_part = if author.is_empty() { String::new() } else { format!(" — {}", author) };
@@ -234,7 +235,7 @@ pub fn draw_ui(f: &mut Frame, app: &mut App) {
                 } else if checked {
                     Style::default().fg(Color::Cyan)
                 } else {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(Color::Reset)
                 };
                 ListItem::new(format!("{}{}{}", prefix, label, meta_str)).style(style)
             })
@@ -269,7 +270,7 @@ pub fn draw_ui(f: &mut Frame, app: &mut App) {
             .border_style(Style::default().fg(Color::Cyan));
         let p = Paragraph::new(Line::from(Span::styled(
             msg,
-            Style::default().fg(Color::White),
+            Style::default().fg(Color::Reset),
         )))
         .block(loading_block)
         .alignment(Alignment::Center);
@@ -318,7 +319,7 @@ pub fn draw_ui(f: &mut Frame, app: &mut App) {
                     crate::browser::LinkKind::Article => (" [Art] ", Color::Green),
                     crate::browser::LinkKind::Author => (" [@Usr] ", Color::Cyan),
                     crate::browser::LinkKind::Feed => (" [Feed] ", Color::Magenta),
-                    crate::browser::LinkKind::Other => (" [Link] ", Color::White),
+                    crate::browser::LinkKind::Other => (" [Link] ", Color::Reset),
                 };
 
                 let style = if is_selected {
@@ -326,7 +327,7 @@ pub fn draw_ui(f: &mut Frame, app: &mut App) {
                 } else if is_checked {
                     Style::default().fg(Color::Green)
                 } else {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(Color::Reset)
                 };
 
                 let checkbox = if link.kind == crate::browser::LinkKind::Article {
@@ -382,6 +383,56 @@ pub fn draw_ui(f: &mut Frame, app: &mut App) {
         return;
     }
 
+    if let AppView::Chat { input, cursor_x, messages, scroll_y, is_streaming, .. } = &mut app.view {
+        let chat_block = Block::default()
+            .title(" RAG Chat ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Magenta));
+
+        let inner = chat_block.inner(chunks[1]);
+        let height = inner.height as usize;
+
+        let mut lines: Vec<Line> = Vec::new();
+        for msg in messages.iter() {
+            match msg.role {
+                ChatRole::User => {
+                    lines.push(Line::from(Span::styled(
+                        format!("You: {}", msg.content),
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    )));
+                }
+                ChatRole::Assistant => {
+                    lines.push(Line::from(Span::styled("Assistant:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))));
+                    lines.extend(render_markdown(&msg.content));
+                }
+            }
+            lines.push(Line::from(Span::raw("")));
+        }
+
+        let max_scroll = lines.len().saturating_sub(height);
+        *scroll_y = (*scroll_y).min(max_scroll);
+
+        let chat_p = Paragraph::new(lines)
+            .block(chat_block)
+            .wrap(Wrap { trim: false })
+            .scroll((*scroll_y as u16, 0));
+        f.render_widget(chat_p, chunks[1]);
+
+        let input_block = Block::default()
+            .title(if *is_streaming { " Chat Input (waiting for response...) " } else { " Chat Input " })
+            .borders(Borders::ALL)
+            .border_type(BorderType::Double)
+            .border_style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD));
+        let input_inner = input_block.inner(chunks[2]);
+        let input_p = Paragraph::new(Line::from(Span::raw(input.as_str()))).block(input_block);
+        f.render_widget(input_p, chunks[2]);
+        let screen_x = (*cursor_x).min(input_inner.width as usize);
+        f.set_cursor_position((input_inner.x + screen_x as u16, input_inner.y));
+
+        return;
+    }
+
     match &mut app.view {
         AppView::Download => {
             let main_chunks = Layout::default()
@@ -419,7 +470,7 @@ pub fn draw_ui(f: &mut Frame, app: &mut App) {
                     } else if log.contains("Warning") {
                         Line::from(Span::styled(log, Style::default().fg(Color::Yellow)))
                     } else if log.starts_with('[') {
-                        Line::from(Span::styled(log, Style::default().fg(Color::White)))
+                        Line::from(Span::styled(log, Style::default().fg(Color::Reset)))
                     } else {
                         Line::from(Span::raw(log))
                     }
@@ -473,7 +524,7 @@ pub fn draw_ui(f: &mut Frame, app: &mut App) {
                             .bg(Color::Yellow)
                             .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(Color::White)
+                        Style::default().fg(Color::Reset)
                     };
                     let fname = std::path::Path::new(name)
                         .file_name()
@@ -520,5 +571,6 @@ pub fn draw_ui(f: &mut Frame, app: &mut App) {
         AppView::AuthorBrowser { .. } => unreachable!(),
         AppView::Loading { .. } => unreachable!(),
         AppView::Browser { .. } => unreachable!(),
+        AppView::Chat { .. } => unreachable!(),
     }
 }

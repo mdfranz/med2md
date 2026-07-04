@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use crate::browser::{BrowserLink, BrowserCommand};
+use crate::chat::ChatProvider;
+use crate::embed::EmbedProvider;
 
 pub enum PickerPane {
     Files,
@@ -54,6 +56,24 @@ pub enum AppView {
         scroll_offset: usize,
         selected: HashSet<String>,
     },
+    Chat {
+        input: String,
+        cursor_x: usize,
+        messages: Vec<ChatMessage>,
+        scroll_y: usize,
+        is_streaming: bool,
+        rag_history: Vec<rig_core::message::Message>,
+    },
+}
+
+pub enum ChatRole {
+    User,
+    Assistant,
+}
+
+pub struct ChatMessage {
+    pub role: ChatRole,
+    pub content: String,
 }
 
 pub enum AppEvent {
@@ -71,6 +91,9 @@ pub enum AppEvent {
         url: String,
         links: Vec<BrowserLink>,
     },
+    ChatToken(String),
+    ChatTurnDone(Vec<rig_core::message::Message>),
+    ChatError(String),
 }
 
 pub struct App {
@@ -96,6 +119,9 @@ pub struct App {
     pub author_sort: AuthorSort,
     pub enrichment_throttle: Option<u64>,
     pub browser_tx: Option<tokio::sync::mpsc::UnboundedSender<BrowserCommand>>,
+    pub chat_provider: Option<std::sync::Arc<ChatProvider>>,
+    pub chat_model: String,
+    pub rag_index: Option<std::sync::Arc<rig_lancedb::LanceDbVectorIndex<EmbedProvider>>>,
 }
 
 impl App {
@@ -127,6 +153,9 @@ impl App {
             author_meta: HashMap::new(),
             author_sort: AuthorSort::Alpha,
             enrichment_throttle: None,
+            chat_provider: None,
+            chat_model: String::new(),
+            rag_index: None,
         }
     }
 
