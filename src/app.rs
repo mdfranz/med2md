@@ -95,7 +95,6 @@ pub struct App {
     pub author_meta: HashMap<String, (i64, usize)>,
     pub author_sort: AuthorSort,
     pub enrichment_throttle: Option<u64>,
-    pub use_chromium: bool,
     pub browser_tx: Option<tokio::sync::mpsc::UnboundedSender<BrowserCommand>>,
 }
 
@@ -116,7 +115,6 @@ impl App {
             is_downloading: false,
             force_download: false,
             urls_scroll_y: 0,
-            use_chromium: false,
             browser_tx: None,
 
             view: AppView::Download,

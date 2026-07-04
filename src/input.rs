@@ -446,7 +446,6 @@ pub fn start_download(app: &mut App, tx: mpsc::UnboundedSender<AppEvent>) {
     let cf_clearance = app.cf_clearance.trim().to_string();
     let output_dir = app.output_dir.clone();
     let force_download = app.force_download;
-    let use_chromium = app.use_chromium;
 
     if sid.is_empty() {
         app.log("Warning: MEDIUM_SID is not set. Fetching public version.".to_string());
@@ -481,7 +480,7 @@ pub fn start_download(app: &mut App, tx: mpsc::UnboundedSender<AppEvent>) {
             }
             let _ = tx.send(AppEvent::Log(format!("[{}/{}] Downloading {}...", num, total, url_str)));
 
-            match perform_download(&client, url_str, &sid, &uid, &cf_clearance, &output_dir, force_download, use_chromium, &tx).await {
+            match perform_download(&client, url_str, &sid, &uid, &cf_clearance, &output_dir, force_download, &tx).await {
                 Ok(filename) => {
                     let _ = tx.send(AppEvent::Log(format!("[{}/{}] Success! Saved to {}", num, total, filename)));
                 }

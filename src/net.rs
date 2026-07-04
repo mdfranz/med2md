@@ -4,9 +4,6 @@ use tokio::sync::mpsc;
 use crate::app::AppEvent;
 use crate::util::{extract_slug, get_jitter_ms};
 use crate::html::{clean_article_and_collect_images, clean_markdown, inject_source_link};
-use chromiumoxide::{Browser, BrowserConfig};
-use chromiumoxide::cdp::browser_protocol::network::CookieParam;
-use futures::StreamExt;
 
 pub fn build_cookie_headers(sid: &str, uid: &str, cf_clearance: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -41,7 +38,6 @@ pub async fn perform_download(
     cf_clearance: &str,
     output_dir: &str,
     force: bool,
-    use_chromium: bool,
     tx: &mpsc::UnboundedSender<AppEvent>,
 ) -> Result<String, String> {
     let slug = extract_slug(url_str);
@@ -52,10 +48,7 @@ pub async fn perform_download(
         return Ok(format!("{} (skipped, already exists)", filename));
     }
 
-    let html_content = if use_chromium {
-        let _ = tx.send(AppEvent::Log("Fetching article via headless Chromium...".to_string()));
-        fetch_html_chromium(url_str, sid, uid, cf_clearance).await?
-    } else {
+    let html_content = {
         let mut headers = build_cookie_headers(sid, uid, cf_clearance);
         headers.insert(ACCEPT, HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8"));
 
@@ -153,156 +146,3 @@ pub async fn perform_download(
     Ok(filename)
 }
 
-pub async fn fetch_html_chromium(
-    url_str: &str,
-    sid: &str,
-    uid: &str,
-    cf_clearance: &str,
-) -> Result<String, String> {
-    let user_agent = std::env::var("MEDIUM_USER_AGENT")
-        .unwrap_or_else(|_| "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36".to_string());
-
-    let config = BrowserConfig::builder()
-        .chrome_executable("/usr/bin/chromium")
-        .arg("--headless")
-        .arg("--no-sandbox")
-        .arg("--disable-gpu")
-        .arg("--disable-blink-features=AutomationControlled")
-        .arg("--host-resolver-rules=MAP challenges.cloudflare.com ~NOTFOUND")
-        .arg(format!("--user-agent={}", user_agent))
-        .build()
-        .map_err(|e| format!("Failed to build browser config: {}", e))?;
-
-    let (mut browser, mut handler) = Browser::launch(config)
-        .await
-        .map_err(|e| format!("Failed to launch Chromium: {}", e))?;
-
-    let handle = tokio::spawn(async move {
-        while let Some(h) = handler.next().await {
-            if h.is_err() {
-                break;
-            }
-        }
-    });
-
-    let page = browser
-        .new_page("about:blank")
-        .await
-        .map_err(|e| format!("Failed to create new page: {}", e))?;
-
-    let stealth_js = r#"
-        try {
-            delete Object.getPrototypeOf(navigator).webdriver;
-        } catch (e) {}
-        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
-        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-        window.chrome = { runtime: {} };
-        try {
-            const originalQuery = window.navigator.permissions.query;
-            window.navigator.permissions.query = (parameters) => (
-                parameters.name === 'notifications' ?
-                    Promise.resolve({ state: Notification.permission }) :
-                    originalQuery(parameters)
-            );
-        } catch (e) {}
-        try {
-            const getParameter = WebGLRenderingContext.prototype.getParameter;
-            WebGLRenderingContext.prototype.getParameter = function(parameter) {
-                if (parameter === 37445) return 'Google Inc. (Intel)';
-                if (parameter === 37446) return 'Intel Iris OpenGL Engine';
-                return getParameter(parameter);
-            };
-        } catch (e) {}
-    "#;
-
-    if let Err(e) = page.evaluate_on_new_document(stealth_js).await {
-        tracing::warn!("Failed to inject stealth script: {}", e);
-    }
-
-    if let Err(e) = page.goto("https://medium.com/robots.txt").await {
-        tracing::warn!("Initial navigation to medium.com/robots.txt failed (expected if not logged in yet): {}", e);
-    }
-
-    tracing::info!("Setting cookies in Chromium...");
-    if !sid.is_empty() {
-        let cookie = CookieParam::builder()
-            .name("sid")
-            .value(sid)
-            .domain(".medium.com")
-            .path("/")
-            .secure(true)
-            .build()
-            .map_err(|e| format!("Failed to build sid cookie param: {}", e))?;
-        page.set_cookie(cookie)
-            .await
-            .map_err(|e| format!("Failed to set sid cookie: {}", e))?;
-    }
-    if !uid.is_empty() {
-        let cookie = CookieParam::builder()
-            .name("uid")
-            .value(uid)
-            .domain(".medium.com")
-            .path("/")
-            .secure(true)
-            .build()
-            .map_err(|e| format!("Failed to build uid cookie param: {}", e))?;
-        page.set_cookie(cookie)
-            .await
-            .map_err(|e| format!("Failed to set uid cookie: {}", e))?;
-    }
-    if !cf_clearance.is_empty() {
-        let cookie = CookieParam::builder()
-            .name("cf_clearance")
-            .value(cf_clearance)
-            .domain(".medium.com")
-            .path("/")
-            .secure(true)
-            .build()
-            .map_err(|e| format!("Failed to build cf_clearance cookie param: {}", e))?;
-        page.set_cookie(cookie)
-            .await
-            .map_err(|e| format!("Failed to set cf_clearance cookie: {}", e))?;
-    }
-
-    match page.get_cookies().await {
-        Ok(c) => {
-            let names: Vec<String> = c.iter().map(|cookie| format!("{} (domain={})", cookie.name, cookie.domain)).collect();
-            tracing::info!("Cookies currently in Chromium: {:?}", names);
-        }
-        Err(e) => {
-            tracing::warn!("Failed to retrieve cookies in Chromium: {}", e);
-        }
-    }
-
-    // Navigate to the target page URL
-    tracing::info!("Navigating to article URL: {}", url_str);
-    page.goto(url_str)
-        .await
-        .map_err(|e| format!("Failed to navigate to target URL: {}", e))?;
-
-    if let Ok(Some(title)) = page.get_title().await {
-        tracing::info!("Loaded page title: {}", title);
-    }
-
-    // Wait for the page content to load. Since Medium dynamically renders content,
-    // we wait for the <article> element. We'll poll for it up to 5 seconds.
-    let poll_start = std::time::Instant::now();
-    while poll_start.elapsed() < std::time::Duration::from_secs(5) {
-        if page.find_element("article").await.is_ok() {
-            break;
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
-    }
-
-    // Get rendered HTML
-    let html = page
-        .content()
-        .await
-        .map_err(|e| format!("Failed to get page content: {}", e))?;
-
-    // Clean up
-    let _ = browser.close().await;
-    let _ = handle.await;
-
-    Ok(html)
-}
