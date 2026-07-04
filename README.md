@@ -53,7 +53,7 @@ If unset, `med2md` will prompt interactively for cookies on startup.
 ## Documentation
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — system diagrams, async layers, and the article parsing pipeline
-- [MEDIUM.md](MEDIUM.md) — how med2md authenticates with and scrapes Medium
+- [references/MEDIUM.md](references/MEDIUM.md) — how med2md authenticates with and scrapes Medium
 - [PKG.md](PKG.md) — external crates and why each is used
 - [PROJECT.md](PROJECT.md) — feature history and codebase evolution
 - [AGENTS.md](AGENTS.md) — instructions for AI coding agents working in this repo

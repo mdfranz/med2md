@@ -42,7 +42,7 @@ The project has evolved through several key phases recorded in its git history:
     *   Standardized all documentation references to use strictly relative links (`[link](path)`) and comply with [AGENTS.md](AGENTS.md) rules.
 *   **Key Files Added**:
     *   [ARCHITECTURE.md](ARCHITECTURE.md): High-level block and flow diagrams mapping parsing tasks.
-    *   [MEDIUM.md](MEDIUM.md): Detailing the network endpoints, Apollo GraphQL state harvesting, and XSSI security bypass mechanisms.
+    *   [references/MEDIUM.md](references/MEDIUM.md): Detailing the network endpoints, Apollo GraphQL state harvesting, and XSSI security bypass mechanisms.
 
 ### Phase 4: Modular Codebase Refactoring
 *   **Git Commits**: `45c2106` (Refactor codebase: modularize main.rs)
@@ -137,6 +137,6 @@ The modern modularized files in `src/` serve distinct roles in the application l
 ## 3. Reference Documentation Mapping
 For deeper technical discussions on specific areas of the `med2md` project, see:
 *   [ARCHITECTURE.md](ARCHITECTURE.md) — Explains the high-level diagrams, asynchronous execution layers, and article parsing pipeline.
-*   [MEDIUM.md](MEDIUM.md) — Details Medium API structures, cookie bypass methods, and DOM scraping logic.
+*   [references/MEDIUM.md](references/MEDIUM.md) — Details Medium API structures, cookie bypass methods, and DOM scraping logic.
 *   [PKG.md](PKG.md) — Focuses on the role and usage of external dependencies declared in `Cargo.toml`.
 *   [AGENTS.md](AGENTS.md) / [CLAUDE.md](CLAUDE.md) — Focuses on instruction guidelines for AI agents interacting with the codebase.
