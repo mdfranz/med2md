@@ -10,12 +10,25 @@ pub async fn retrieve(
     question: &str,
     n: usize,
 ) -> Result<Vec<Chunk>, String> {
+    tracing::debug!(query = question, limit = n, "Retrieving matching chunks from LanceDB");
+
     let req = VectorSearchRequest::builder()
         .query(question)
         .samples(n as u64)
         .build();
 
-    let results: Vec<(f64, String, Chunk)> = index.top_n(req).await.map_err(|e| e.to_string())?;
+    let results: Vec<(f64, String, Chunk)> = index.top_n(req).await.map_err(|e| {
+        tracing::error!(error = %e, query = question, "Failed to query LanceDB index");
+        e.to_string()
+    })?;
+
+    tracing::info!(
+        query = question,
+        match_count = results.len(),
+        matched_slugs = ?results.iter().map(|(_, _, c)| &c.slug).collect::<Vec<_>>(),
+        "RAG retrieval completed"
+    );
+
     Ok(results.into_iter().map(|(_, _, chunk)| chunk).collect())
 }
 

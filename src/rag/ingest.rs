@@ -91,11 +91,16 @@ pub async fn run_index(output_dir: &str, embed_config: &EmbedConfig) -> Result<(
 
     let (table, rebuilt) = schema::open_or_rebuild_table(output_dir, provider_name, &embed_config.model, dims).await?;
     if rebuilt {
-        println!("Index table rebuilt (embedding provider/model/dims changed or table was missing).");
+        tracing::info!(
+            provider = provider_name,
+            model = &embed_config.model,
+            dims,
+            "RAG index table rebuilt (embedding configuration changed or table was missing)"
+        );
     }
 
     let files = markdown_files(output_dir);
-    println!("Found {} markdown file(s) in {}.", files.len(), output_dir);
+    tracing::info!(count = files.len(), directory = %output_dir, "Found markdown files for indexing");
 
     let mut total_chunks = 0usize;
     let mut total_files_indexed = 0usize;
@@ -104,7 +109,7 @@ pub async fn run_index(output_dir: &str, embed_config: &EmbedConfig) -> Result<(
         let content = match std::fs::read_to_string(file) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("Warning: failed to read {}: {}", file.display(), e);
+                tracing::warn!(file = %file.display(), error = %e, "Failed to read markdown file for indexing");
                 continue;
             }
         };
@@ -153,12 +158,17 @@ pub async fn run_index(output_dir: &str, embed_config: &EmbedConfig) -> Result<(
         }
 
         total_files_indexed += 1;
-        println!("Indexed {} ({} chunks).", file.display(), chunk_structs.len());
+        tracing::info!(
+            file = %file.display(),
+            chunks = chunk_structs.len(),
+            "Successfully indexed article"
+        );
     }
 
-    println!(
-        "Done. Indexed {} chunk(s) across {} file(s).",
-        total_chunks, total_files_indexed
+    tracing::info!(
+        total_chunks,
+        total_files_indexed,
+        "RAG indexing run completed"
     );
 
     Ok(())

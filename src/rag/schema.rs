@@ -136,6 +136,14 @@ pub async fn open_or_rebuild_table(
     let rebuilt = !meta_matches || !table_exists;
 
     let table = if rebuilt {
+        tracing::warn!(
+            table_exists,
+            meta_matches,
+            provider = embed_provider,
+            model = embed_model,
+            dims,
+            "Rebuilding RAG index table due to configuration mismatch or missing table"
+        );
         if table_exists {
             db.drop_table(TABLE_NAME, &[]).await.map_err(|e| e.to_string())?;
         }
