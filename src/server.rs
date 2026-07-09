@@ -10,6 +10,7 @@ struct ArticleItem {
     author: String,
     reading_time_mins: usize,
     file_size_bytes: u64,
+    modified: std::time::SystemTime,
     content_prefix: String,
 }
 
@@ -172,7 +173,9 @@ async fn serve_dashboard(socket: &mut tokio::net::TcpStream, output_dir: &str) {
                     let read_time = (word_count / 200).max(1);
                     total_est_read += read_time;
 
-                    let file_size = entry.metadata().await.map(|m| m.len()).unwrap_or(0);
+                    let metadata = entry.metadata().await.ok();
+                    let file_size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+                    let modified = metadata.and_then(|m| m.modified().ok()).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
                     articles.push(ArticleItem {
                         slug,
@@ -181,6 +184,7 @@ async fn serve_dashboard(socket: &mut tokio::net::TcpStream, output_dir: &str) {
                         author,
                         reading_time_mins: read_time,
                         file_size_bytes: file_size,
+                        modified,
                         content_prefix: get_content_prefix(&content, 150),
                     });
                 }
@@ -188,7 +192,7 @@ async fn serve_dashboard(socket: &mut tokio::net::TcpStream, output_dir: &str) {
         }
     }
     
-    articles.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+    articles.sort_by(|a, b| b.modified.cmp(&a.modified));
 
     let cards_html: String = articles.iter().map(render_card).collect();
 
@@ -218,7 +222,7 @@ fn render_card(art: &ArticleItem) -> String {
         r#"<a href="/{slug}" class="article-card">
             <div class="card-content">
                 <div class="card-meta">
-                    <span class="author-badge">{author}</span>
+                    <span class="author-badge" onclick="event.preventDefault(); event.stopPropagation(); filterByAuthor(this.textContent);" title="Filter by this author">{author}</span>
                     {original_link}
                 </div>
                 <h3 class="card-title">{title}</h3>
@@ -513,6 +517,16 @@ const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
             backdrop-filter: blur(8px);
         }
 
+        .stat-card-clickable {
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .stat-card-clickable:hover {
+            border-color: var(--card-hover-border);
+            background: var(--card-hover-bg);
+        }
+
         .stat-val {
             font-family: 'Outfit', sans-serif;
             font-weight: 700;
@@ -551,6 +565,66 @@ const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
         .grid .card-desc {
             font-size: 1rem;
             -webkit-line-clamp: 4;
+        }
+
+        .grid.compact {
+            grid-template-columns: 1fr;
+            gap: 0.75rem;
+        }
+
+        .grid.compact .article-card {
+            flex-direction: row;
+            align-items: center;
+        }
+
+        .grid.compact .card-content {
+            padding: 0.75rem 1.25rem;
+            flex-direction: row;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .grid.compact .card-meta {
+            margin-bottom: 0;
+            flex-shrink: 0;
+            width: 11rem;
+        }
+
+        .grid.compact .card-title {
+            font-size: 0.95rem;
+            margin-bottom: 0;
+            -webkit-line-clamp: 1;
+            flex: 1;
+            min-width: 0;
+        }
+
+        .grid.compact .card-desc {
+            display: none;
+        }
+
+        .grid.compact .card-footer {
+            border-top: none;
+            padding-top: 0;
+            margin-top: 0;
+            flex-shrink: 0;
+            width: auto;
+            font-size: 0.75rem;
+        }
+
+        .author-group-header {
+            grid-column: 1 / -1;
+            font-family: 'Outfit', sans-serif;
+            font-weight: 700;
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-secondary);
+            padding: 1rem 0.25rem 0.25rem;
+            border-bottom: 1px solid var(--card-border);
+        }
+
+        .author-group-header:first-child {
+            padding-top: 0;
         }
 
         .article-card {
@@ -597,6 +671,11 @@ const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
             border-radius: 9999px;
             font-weight: 600;
             font-size: 0.75rem;
+            cursor: pointer;
+        }
+
+        .author-badge:hover {
+            background: rgba(99, 102, 241, 0.25);
         }
 
         .original-link {
@@ -717,11 +796,11 @@ const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
     </header>
     <div class="container">
         <div class="stats-panel">
-            <div class="stat-card">
+            <div class="stat-card stat-card-clickable" id="compact-toggle" title="Toggle compact view">
                 <div class="stat-val">{total_count}</div>
                 <div class="stat-label">Total Articles</div>
             </div>
-            <div class="stat-card">
+            <div class="stat-card stat-card-clickable" id="author-group-toggle" title="Group articles by author">
                 <div class="stat-val">{author_count}</div>
                 <div class="stat-label">Authors</div>
             </div>
@@ -771,9 +850,90 @@ const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
             setDarkMode();
         }
 
+        const articlesGrid = document.getElementById('articles-grid');
+        const compactToggle = document.getElementById('compact-toggle');
         const searchInput = document.getElementById('search-input');
         const emptyState = document.getElementById('empty-state');
-        
+
+        const setCompactMode = (on) => {
+            articlesGrid.classList.toggle('compact', on);
+            localStorage.setItem('compactView', on ? '1' : '0');
+        };
+
+        compactToggle.addEventListener('click', () => {
+            if (articlesGrid.classList.contains('grouped')) {
+                ungroupArticles();
+            }
+            setCompactMode(!articlesGrid.classList.contains('compact'));
+        });
+
+        if (localStorage.getItem('compactView') === '1') {
+            setCompactMode(true);
+        }
+
+        function filterByAuthor(author) {
+            searchInput.value = author;
+            searchInput.dispatchEvent(new Event('input'));
+            searchInput.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+
+        const authorGroupToggle = document.getElementById('author-group-toggle');
+        let originalCardOrder = null;
+        let wasCompactBeforeGroup = false;
+
+        function groupByAuthor() {
+            document.querySelectorAll('.author-group-header').forEach(el => el.remove());
+
+            const cards = Array.from(articlesGrid.querySelectorAll('.article-card'));
+            originalCardOrder = cards.slice();
+
+            cards.sort((a, b) => {
+                const authorA = a.querySelector('.author-badge').textContent.toLowerCase();
+                const authorB = b.querySelector('.author-badge').textContent.toLowerCase();
+                return authorA.localeCompare(authorB);
+            });
+
+            const fragment = document.createDocumentFragment();
+            let lastAuthor = null;
+            cards.forEach(card => {
+                const author = card.querySelector('.author-badge').textContent;
+                if (author !== lastAuthor) {
+                    const header = document.createElement('div');
+                    header.className = 'author-group-header';
+                    header.textContent = author;
+                    fragment.appendChild(header);
+                    lastAuthor = author;
+                }
+                fragment.appendChild(card);
+            });
+
+            articlesGrid.insertBefore(fragment, emptyState);
+            wasCompactBeforeGroup = articlesGrid.classList.contains('compact');
+            articlesGrid.classList.add('compact', 'grouped');
+        }
+
+        function ungroupArticles() {
+            document.querySelectorAll('.author-group-header').forEach(el => el.remove());
+            if (originalCardOrder) {
+                const fragment = document.createDocumentFragment();
+                originalCardOrder.forEach(card => fragment.appendChild(card));
+                articlesGrid.insertBefore(fragment, emptyState);
+                originalCardOrder = null;
+            }
+            articlesGrid.classList.remove('grouped');
+            if (!wasCompactBeforeGroup) {
+                articlesGrid.classList.remove('compact');
+            }
+        }
+
+        authorGroupToggle.addEventListener('click', () => {
+            if (articlesGrid.classList.contains('grouped')) {
+                ungroupArticles();
+            } else {
+                groupByAuthor();
+            }
+        });
+
         searchInput.addEventListener('input', (e) => {
             const query = e.target.value.toLowerCase().trim();
             const cards = document.querySelectorAll('.article-card');
