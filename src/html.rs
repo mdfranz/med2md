@@ -2,23 +2,93 @@ use scraper::{Html, Selector};
 use markup5ever::{QualName, Namespace, LocalName};
 use crate::util::get_extension;
 
+/// Medium articles render their H1 as either an ATX heading (`# Title`) or a
+/// Setext heading (`Title` followed by a line of `===`), depending on the
+/// source markup. Both must be recognized here, or articles using the Setext
+/// form silently skip title-link injection and fall back to the raw file slug
+/// as their title everywhere downstream (dashboard, article page).
 pub fn inject_source_link(md: &str, url: &str) -> String {
+    let lines: Vec<&str> = md.lines().collect();
     let mut result = String::new();
     let mut injected = false;
-    for line in md.lines() {
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
         if !injected && line.starts_with("# ") {
-            let title = &line[2..];
-            result.push_str(&format!("# [{}]({})\n", title, url));
+            result.push_str(&format!("# [{}]({})\n", &line[2..], url));
             injected = true;
-        } else {
-            result.push_str(line);
-            result.push('\n');
+            i += 1;
+            continue;
         }
+        if !injected && !line.trim().is_empty() {
+            if let Some(next) = lines.get(i + 1) {
+                let underline = next.trim();
+                if !underline.is_empty() && underline.chars().all(|c| c == '=') {
+                    result.push_str(&format!("# [{}]({})\n", line.trim(), url));
+                    injected = true;
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        result.push_str(line);
+        result.push('\n');
+        i += 1;
     }
     if !injected {
         result = format!("[Source]({})\n\n{}", url, result);
     }
     result.trim_end().to_string()
+}
+
+/// Retrofit for already-downloaded files written before Setext-heading
+/// detection existed: they got the `[Source](url)` fallback prefix instead of
+/// a proper `# [Title](url)`, leaving the raw `Title\n====\n` intact right
+/// after it. Merge that pattern into the standard injected-title form.
+pub fn fix_setext_title_link(md: &str) -> String {
+    let lines: Vec<&str> = md.lines().collect();
+    if lines.len() < 4 {
+        return md.to_string();
+    }
+    let source_line = lines[0];
+    if !source_line.starts_with("[Source](") || !source_line.ends_with(')') {
+        return md.to_string();
+    }
+    if !lines[1].trim().is_empty() {
+        return md.to_string();
+    }
+    let title_line = lines[2].trim();
+    if title_line.is_empty() {
+        return md.to_string();
+    }
+    let underline = lines[3].trim();
+    if underline.is_empty() || !underline.chars().all(|c| c == '=') {
+        return md.to_string();
+    }
+    let url = &source_line[9..source_line.len() - 1];
+    let mut result = format!("# [{}]({})\n", title_line, url);
+    result.push_str(&lines[4..].join("\n"));
+    result
+}
+
+/// Medium wraps external link-preview embeds (e.g. GitHub/repo cards) in a single
+/// `<a>` containing block-level children (title, description, site name). html2md
+/// converts that into one `[...](url)` link whose bracketed text spans blank-line
+/// separated paragraphs, which CommonMark can't parse as a link — renderers show
+/// the bracket text as plain paragraphs followed by a stray `](url)`. Flatten any
+/// link text that contains a blank line into a single line so it parses correctly.
+pub fn fix_broken_card_links(md: &str) -> String {
+    let re = regex::Regex::new(r"\[([^\[\]]*)\]\(([^()\s]+)\)").unwrap();
+    re.replace_all(md, |caps: &regex::Captures| {
+        let text = &caps[1];
+        let url = &caps[2];
+        if text.contains("\n\n") {
+            let flattened = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            format!("[{}]({})", flattened, url)
+        } else {
+            caps[0].to_string()
+        }
+    }).to_string()
 }
 
 pub fn clean_markdown(md_text: &str) -> String {

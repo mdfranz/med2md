@@ -21,6 +21,8 @@ mod llm_config;
 mod embed;
 mod chat;
 mod rag;
+mod server;
+mod checkmd;
 use chat::ChatProvider;
 use embed::EmbedProvider;
 
@@ -47,11 +49,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  med2md --authors          Browse followed authors, select, then fetch their articles");
         println!("  med2md --dir <path>       Output directory for downloaded articles (default: ~/.local/med2md)");
         println!("  med2md --browse           Browse already-downloaded markdown files");
+        println!("  med2md --serve            Launch HTTP server to browse downloaded articles in a browser");
+        println!("  med2md --port <number>    Port to run the HTTP server on (default: 3000)");
         println!("  med2md --force            Re-download articles even if they already exist");
         println!("  med2md --refresh          Ignore cache and re-fetch authors/feed from Medium");
         println!("  med2md --web              Launch TUI web browser to browse and select articles");
         println!("  med2md --log <path>       Write JSON logs to <path> (default: medium.log)");
         println!("  med2md --index            Index downloaded markdown into the local RAG vector store, then exit");
+        println!("  med2md --checkmd          Scan downloaded markdown for known issues and fix them in place");
+        println!("  med2md --checkmd --dry-run   Report what --checkmd would fix, without writing files");
         println!("  med2md --chat-provider <p>   Chat completion provider: openai, anthropic, gemini (default: anthropic)");
         println!("  med2md --chat-model <m>      Chat completion model (default: claude-sonnet-4-5)");
         println!("  med2md --embed-provider <p>  Embedding provider: openai, gemini (default: openai)");
@@ -98,6 +104,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let refresh = args.iter().any(|a| a == "--refresh");
     let web_mode = args.iter().any(|a| a == "--web");
     let index_mode = args.iter().any(|a| a == "--index");
+    let serve_mode = args.iter().any(|a| a == "--serve");
+    let checkmd_mode = args.iter().any(|a| a == "--checkmd");
+    let dry_run = args.iter().any(|a| a == "--dry-run");
 
     let chat_provider_arg = args.windows(2).find(|w| w[0] == "--chat-provider").map(|w| w[1].clone());
     let chat_model_arg = args.windows(2).find(|w| w[0] == "--chat-model").map(|w| w[1].clone());
@@ -113,6 +122,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             format!("{}/.local/med2md", home)
         });
 
+    let port = args.windows(2)
+        .find(|w| w[0] == "--port")
+        .and_then(|w| w[1].parse::<u16>().ok())
+        .unwrap_or(3000);
+
     if index_mode {
         let embed_config = match llm_config::load_embed_config(embed_provider_arg, embed_model_arg) {
             Ok(c) => c,
@@ -122,6 +136,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         if let Err(e) = rag::ingest::run_index(&output_dir_early, &embed_config).await {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    if serve_mode {
+        if let Err(e) = server::run_server(&output_dir_early, port).await {
+            eprintln!("Server Error: {}", e);
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    if checkmd_mode {
+        if let Err(e) = checkmd::run_checkmd(&output_dir_early, dry_run).await {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }

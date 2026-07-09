@@ -4168,6 +4168,7 @@ dependencies = [
  "html2md",
  "lancedb",
  "markup5ever",
+ "percent-encoding",
  "ratatui",
  "regex",
  "reqwest 0.12.28",
