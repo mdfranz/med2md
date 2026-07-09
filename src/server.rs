@@ -1,7 +1,15 @@
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
+use axum::{
+    extract::{Path as RoutePath, State},
+    http::StatusCode,
+    response::{Html, IntoResponse, Response},
+    routing::get,
+    Router,
+};
 use tokio::net::TcpListener;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tower_http::services::ServeDir;
 
 struct ArticleItem {
     slug: String,
@@ -14,123 +22,57 @@ struct ArticleItem {
     content_prefix: String,
 }
 
+const NOT_FOUND_BODY: &str = "<h1>404 Not Found</h1><p>The requested page or article could not be found.</p>";
+
 pub async fn run_server(output_dir: &str, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    let output_dir = Arc::new(output_dir.to_string());
+    let images = ServeDir::new(output_dir.as_str());
+
+    // "/{slug}" only matches single-segment paths (article views); anything
+    // deeper — e.g. "/<slug>_images/<file>" — falls through to ServeDir,
+    // which maps it straight onto output_dir/<slug>_images/<file> on disk
+    // and handles path-traversal safety itself.
+    let app = Router::new()
+        .route("/", get(dashboard_handler))
+        .route("/index.html", get(dashboard_handler))
+        .route("/{slug}", get(article_handler))
+        .fallback_service(images)
+        .with_state(output_dir);
+
     let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
     println!("--------------------------------------------------");
     println!("med2md local reader server running!");
     println!("Open your browser and navigate to: http://localhost:{}", port);
     println!("Press Ctrl+C in this terminal to stop the server.");
     println!("--------------------------------------------------");
-    
-    let output_dir_str = output_dir.to_string();
-    
-    loop {
-        let (mut socket, _) = match listener.accept().await {
-            Ok(val) => val,
-            Err(_) => continue,
-        };
-        
-        let output_dir = output_dir_str.clone();
-        tokio::spawn(async move {
-            let mut buf = [0; 4096];
-            let n = match socket.read(&mut buf).await {
-                Ok(n) if n > 0 => n,
-                _ => return,
-            };
-            
-            let request = String::from_utf8_lossy(&buf[..n]);
-            let mut lines = request.lines();
-            let req_line = match lines.next() {
-                Some(line) => line,
-                None => return,
-            };
-            
-            let parts: Vec<&str> = req_line.split_whitespace().collect();
-            if parts.len() < 2 { return; }
-            let method = parts[0];
-            let raw_path = parts[1];
-            
-            if method != "GET" {
-                let response = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                let _ = socket.write_all(response.as_bytes()).await;
-                return;
-            }
-            
-            // Extract and percent decode the path
-            let clean_path = raw_path.split('?').next().unwrap_or(raw_path).split('#').next().unwrap_or(raw_path);
-            let decoded_path = match percent_encoding::percent_decode_str(clean_path).decode_utf8_lossy() {
-                std::borrow::Cow::Borrowed(s) => s.to_string(),
-                std::borrow::Cow::Owned(s) => s,
-            };
-            
-            // 1. Static images requests: /<slug>_images/<img_file> or paths containing _images/
-            if decoded_path.contains("_images/") {
-                let rel_path = decoded_path.trim_start_matches('/');
-                let file_path = Path::new(&output_dir).join(rel_path);
-                
-                // Security check: ensure path does not escape output_dir
-                if !file_path.starts_with(Path::new(&output_dir)) {
-                    let response = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                    let _ = socket.write_all(response.as_bytes()).await;
-                    return;
-                }
-                
-                if let Ok(mut file) = tokio::fs::File::open(&file_path).await {
-                    let mut contents = Vec::new();
-                    if file.read_to_end(&mut contents).await.is_ok() {
-                        let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                        let content_type = match ext.to_lowercase().as_str() {
-                            "png" => "image/png",
-                            "jpg" | "jpeg" => "image/jpeg",
-                            "webp" => "image/webp",
-                            "gif" => "image/gif",
-                            "svg" => "image/svg+xml",
-                            _ => "application/octet-stream",
-                        };
-                        let response_header = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            content_type,
-                            contents.len()
-                        );
-                        let _ = socket.write_all(response_header.as_bytes()).await;
-                        let _ = socket.write_all(&contents).await;
-                        return;
-                    }
-                }
-                
-                let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                let _ = socket.write_all(response.as_bytes()).await;
-                return;
-            }
-            
-            // 2. Dashboard requests
-            if decoded_path == "/" || decoded_path == "/index.html" {
-                serve_dashboard(&mut socket, &output_dir).await;
-                return;
-            }
-            
-            // 3. Article view requests: /<slug>
-            let slug = decoded_path.trim_start_matches('/');
-            let md_file_path = Path::new(&output_dir).join(format!("{}.md", slug));
-            
-            if md_file_path.exists() && md_file_path.starts_with(Path::new(&output_dir)) {
-                serve_article(&mut socket, &md_file_path, slug).await;
-                return;
-            }
-            
-            // 4. Fallback 404
-            let body = "<h1>404 Not Found</h1><p>The requested page or article could not be found.</p>";
-            let response = format!(
-                "HTTP/1.1 404 Not Found\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = socket.write_all(response.as_bytes()).await;
-        });
+
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn dashboard_handler(State(output_dir): State<Arc<String>>) -> Html<String> {
+    Html(serve_dashboard(&output_dir).await)
+}
+
+async fn article_handler(
+    State(output_dir): State<Arc<String>>,
+    RoutePath(slug): RoutePath<String>,
+) -> Response {
+    // Defense in depth: a route param can never contain a raw '/', but a
+    // percent-encoded one (%2F) could decode into one, so reject explicitly
+    // rather than relying solely on the router's segment matching.
+    if slug.contains('/') || slug.contains("..") {
+        return (StatusCode::NOT_FOUND, Html(NOT_FOUND_BODY)).into_response();
+    }
+
+    let md_file_path = Path::new(output_dir.as_str()).join(format!("{}.md", slug));
+    match serve_article(&md_file_path, &slug).await {
+        Some(page) => Html(page).into_response(),
+        None => (StatusCode::NOT_FOUND, Html(NOT_FOUND_BODY)).into_response(),
     }
 }
 
-async fn serve_dashboard(socket: &mut tokio::net::TcpStream, output_dir: &str) {
+async fn serve_dashboard(output_dir: &str) -> String {
     let mut articles = Vec::new();
     let mut authors = HashSet::new();
     let mut total_est_read = 0;
@@ -200,13 +142,8 @@ async fn serve_dashboard(socket: &mut tokio::net::TcpStream, output_dir: &str) {
     page = page.replace("{author_count}", &authors.len().to_string());
     page = page.replace("{total_est_read}", &total_est_read.to_string());
     page = page.replace("{cards}", &cards_html);
-    
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        page.len(),
-        page
-    );
-    let _ = socket.write_all(response.as_bytes()).await;
+
+    page
 }
 
 fn render_card(art: &ArticleItem) -> String {
@@ -255,30 +192,25 @@ fn render_card(art: &ArticleItem) -> String {
     )
 }
 
-async fn serve_article(socket: &mut tokio::net::TcpStream, path: &Path, slug: &str) {
-    if let Ok(content) = tokio::fs::read_to_string(path).await {
-        let mut title = slug.replace('-', " ");
-        for line in content.lines().take(5) {
-            if line.starts_with("# [") {
-                if let Some(end_title) = line.find("](") {
-                    title = strip_markdown_emphasis(&line[3..end_title]);
-                    break;
-                }
+async fn serve_article(path: &Path, slug: &str) -> Option<String> {
+    let content = tokio::fs::read_to_string(path).await.ok()?;
+
+    let mut title = slug.replace('-', " ");
+    for line in content.lines().take(5) {
+        if line.starts_with("# [") {
+            if let Some(end_title) = line.find("](") {
+                title = strip_markdown_emphasis(&line[3..end_title]);
+                break;
             }
         }
-        
-        let json_content = serde_json::to_string(&content).unwrap_or_else(|_| "[]".to_string());
-        
-        let mut page = ARTICLE_HTML_TEMPLATE.replace("{title}", &html_escape(&title));
-        page = page.replace("{raw_markdown_json}", &json_content);
-        
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            page.len(),
-            page
-        );
-        let _ = socket.write_all(response.as_bytes()).await;
     }
+
+    let json_content = serde_json::to_string(&content).unwrap_or_else(|_| "[]".to_string());
+
+    let mut page = ARTICLE_HTML_TEMPLATE.replace("{title}", &html_escape(&title));
+    page = page.replace("{raw_markdown_json}", &json_content);
+
+    Some(page)
 }
 
 fn html_escape(s: &str) -> String {

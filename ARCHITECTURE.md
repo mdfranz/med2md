@@ -200,7 +200,11 @@ The codebase is modularized into discrete sub-modules under `src/` to separate T
 *   **[src/meta.rs](src/meta.rs)**: Coordinates asynchronous background author enrichment via [enrich_authors](src/meta.rs#L83) to fetch the latest post timestamps and post counts for all creators.
 *   **[src/util.rs](src/util.rs)**: Implements common date formatting, slug sanitization, and jitter wait calculation.
 
-### D. RAG, Embeddings & LLM Integration
+### D. Local Reader Web Server & Repair Tooling
+*   **[src/server.rs](src/server.rs)**: `--serve` entry point. A local HTTP server built using `axum` ([run_server](src/server.rs#L27)) that renders a browsable dashboard ([serve_dashboard](src/server.rs#L75)) and per-article reading view ([serve_article](src/server.rs#L195)) directly from the on-disk `.md` archive, with all frontend HTML/CSS/JS inlined as `const` templates. See §5 below.
+*   **[src/checkmd.rs](src/checkmd.rs)**: `--checkmd` entry point. Walks `output_dir` and applies a fixed list of idempotent markdown repair functions ([run_checkmd](src/checkmd.rs#L18)) to already-downloaded files, e.g. fixing broken card links or setext-style title links, without requiring re-download.
+
+### E. RAG, Embeddings & LLM Integration
 
 *   **[src/llm_config.rs](src/llm_config.rs)**: Configuration resolution for chat and embedding providers. Reads CLI flags and environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `MED2MD_CHAT_PROVIDER`, etc.) and applies precedence: CLI > env var > default.
 *   **[src/chat.rs](src/chat.rs)**: [ChatProvider](src/chat.rs) enum wrapping OpenAI/Anthropic/Gemini clients. Implements [stream_chat](src/chat.rs) to map provider-specific streaming responses into a unified `TokenStream` type (Pin<Box<dyn Stream<Item = ChatStreamEvent>>>).
@@ -212,7 +216,50 @@ The codebase is modularized into discrete sub-modules under `src/` to separate T
 
 ---
 
-## 5. Key Architectural Choices
+## 5. Local Reader Web Server
+
+`--serve` starts a local HTTP server ([src/server.rs](src/server.rs)) built on top of `axum` and `tower-http` that lets users browse their downloaded article archive in a browser instead of the TUI. It uses `axum::Router` to route dashboard and article views, and leverages `tower_http::services::ServeDir` to securely serve static image assets located under the archive directory.
+
+```mermaid
+flowchart TD
+    req([HTTP Request]) --> route{Route Match?}
+    route -- "/ or /index.html" --> db_handler[dashboard_handler]
+    route -- "/{slug}" --> art_handler[article_handler]
+    route -- fallback --> serve_dir[ServeDir for output_dir]
+    serve_dir --> img{File exists under output_dir?}
+    img -- Yes --> serve_file[Stream file bytes]
+    img -- No --> f404_2([404 Not Found])
+    db_handler --> serve_db[serve_dashboard]
+    art_handler --> serve_art[serve_article]
+```
+
+### Dashboard rendering ([serve_dashboard](src/server.rs#L75))
+- Walks `output_dir` for `*.md` files, skipping known doc files (`README.md`, `ARCHITECTURE.md`, `PROJECT.md`, `PKG.md`, `AGENTS.md`, `CLAUDE.md`).
+- Per file, extracts title/source URL from the leading `# [Title](url)` line, derives author from the URL host (`*.medium.com`) or `/@handle` path segment, estimates reading time from word count, and reads the file's `modified` timestamp via filesystem metadata.
+- Sorts articles **newest-file-first** by mtime — a proxy for "date added to the local archive," since Medium's true publish date is discovered during RSS/API scraping (`src/articles.rs`) but is not currently persisted into the saved markdown.
+- Renders one `article-card` per file into `DASHBOARD_HTML_TEMPLATE`: a single `const` HTML string with fully inlined CSS and vanilla JS — no build step, bundler, or JS framework.
+
+### Article rendering ([serve_article](src/server.rs#L195))
+- Reads the raw markdown file, JSON-encodes its contents, and injects it into `ARTICLE_HTML_TEMPLATE`, which renders the markdown client-side using the `marked` and `Prism.js` CDN scripts — the only external JS dependencies anywhere in the reader.
+
+### Browser-side interactivity (the "cruft" — lives entirely in the served HTML, not the Rust binary)
+- **Search** — filters `.article-card` elements client-side by substring match against title/author/description.
+- **Compact view toggle** — clicking the "Total Articles" stat tile toggles a `.compact` CSS class on the grid for a denser, single-column layout; persisted across reloads via `localStorage`.
+- **Author grouping** — clicking the "Authors" stat tile re-sorts and re-wraps `.article-card` DOM nodes into author-labeled sections (`.author-group-header`), restoring original document order when toggled off.
+- **Per-card author filter** — clicking an author badge on a card populates the search box with that author's name and dispatches a synthetic `input` event, reusing the search filter path rather than a separate filter implementation.
+- **Theme toggle** — light/dark mode via a `data-theme` attribute on `<html>`, persisted in `localStorage`.
+
+Because every response is a fully self-contained page and the server is stateless between requests, all of the above is reconstructed from scratch (or restored from `localStorage`) on every navigation — there is no server round-trip for search, filtering, grouping, or theme.
+
+---
+
+## 6. Markdown Repair Tool (`checkmd`)
+
+`--checkmd` (optionally combined with `--dry-run`) runs [run_checkmd](src/checkmd.rs#L18), which walks `output_dir` for `.md` files and applies a fixed, ordered list of idempotent repair functions ([Fixer](src/checkmd.rs#L6)) sourced from [src/html.rs](src/html.rs) — e.g. `fix_setext_title_link` and `fix_broken_card_links` — writing back only files where a fixer actually changed the content. It exists to patch articles downloaded before a markdown-cleaning bug fix, without requiring a full re-download from Medium.
+
+---
+
+## 7. Key Architectural Choices
 
 1.  **Asynchronous Background Concurrency**: Heavy-weight IO operations (such as scraping, RSS fetching, author enrichment, and HTTP downloading) are offloaded to tokio threads via `tokio::spawn`. This prevents blockages in TUI rendering or user key processing.
 2.  **Sequential Downloads with Jitter**: To protect the user's IP address and session from security challenges and rate-limiting from Cloudflare/Medium, downloads are executed sequentially rather than in parallel, separated by jittered delay periods.
@@ -222,3 +269,4 @@ The codebase is modularized into discrete sub-modules under `src/` to separate T
 6.  **Provider Enum Dispatch for LLM Abstraction**: Rather than attempting to make `Agent<M>` and `CompletionModel` types themselves `dyn`-compatible (which violates Rust's trait object safety rules due to RPITIT generics), the architecture uses enum dispatch over concrete provider clients (`ChatProvider::OpenAI`, `Anthropic`, `Gemini`). Stream items are boxed only at the output boundary (`TokenStream`), erasing type information only at the point of consumption in the UI.
 7.  **Provider-Agnostic Embedding Interface**: The `EmbedProvider` enum implements the `rig_core::EmbeddingModel` trait, allowing ingestion and query code to remain agnostic to the concrete embedding provider. The vector dimension is queried at runtime via `model.ndims()`, eliminating the need for hardcoded dimension constants.
 8.  **Independent Embedding & Chat Provider Selection**: Embedding provider/model is configured separately from chat provider/model (e.g., can use OpenAI embeddings with Anthropic chat). This maximizes flexibility since Anthropic offers no embeddings API, while OpenAI, Gemini, and Anthropic all offer chat completions.
+9.  **Axum-Based Local HTTP Server**: The `--serve` reader ([src/server.rs](src/server.rs)) is built on top of `axum` and `tower-http` rather than a hand-rolled TCP parser. This improves reliability, HTTP compliance, and security (by leveraging `tower-http`'s directory traversal protection for serving images) while keeping the implementation clean and focused. All rendering logic — including client-side search, view toggles, and theming — is still pushed into inlined HTML/CSS/JS `const` templates to keep the server itself a thin file-to-HTML mapper with no templating engine dependency.
