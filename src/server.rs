@@ -209,7 +209,7 @@ fn render_card(art: &ArticleItem) -> String {
     let size_str = format!("{:.1} KB", art.file_size_bytes as f64 / 1024.0);
 
     let original_link = if !art.url.is_empty() {
-        format!("<a href=\"{}\" target=\"_blank\" class=\"original-link\" onclick=\"event.stopPropagation();\">Medium ↗</a>", html_escape(&art.url))
+        format!("<span class=\"original-link\" onclick=\"event.preventDefault(); event.stopPropagation(); window.open('{}','_blank');\">Medium ↗</span>", html_escape(&art.url))
     } else {
         String::new()
     };
